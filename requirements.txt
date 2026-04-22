@@ -1,7 +1,18 @@
-faiss-cpu
-sentence-transformers
-requests
-PyMuPDF
-beautifulsoup4
-numpy
-fastapi 
+# AgniAI dependencies
+# Install with:  pip install -r requirements.txt
+
+# Vector search
+faiss-cpu>=1.7.4
+
+# Embeddings (local, offline after first download)
+sentence-transformers>=2.7.0
+
+# PDF extraction
+PyMuPDF>=1.23.0
+
+# Web scraping
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+
+# Numerics (faiss / sentence-transformers dependency)
+numpy>=1.24.0

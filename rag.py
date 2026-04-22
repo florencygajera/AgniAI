@@ -1,5 +1,13 @@
+"""
+rag.py
+======
+Core retrieval-augmented generation layer:
+  - Sentence-transformer embeddings (local, offline)
+  - FAISS IndexFlatIP vector store (inner-product / cosine after L2-norm)
+  - Ollama HTTP client with model auto-detection and fallback
+"""
+
 import json
-from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
 import faiss
@@ -14,21 +22,32 @@ from config import (
     EMBEDDING_MODEL,
     FAISS_INDEX_PATH,
     FALLBACK_MODELS,
+    MIN_SCORE,
     OLLAMA_TAGS_URL,
     OLLAMA_URL,
     REQUEST_TIMEOUT,
     SYSTEM_PROMPT,
 )
 
+# ── Module-level singletons (lazy-loaded) ──────────────────────────────────
 _MODEL: Optional[SentenceTransformer] = None
 _INDEX: Optional[faiss.Index] = None
 _DOCS: List[Dict[str, str]] = []
 
 
+# ── Helpers ────────────────────────────────────────────────────────────────
+
 def _ensure_dirs() -> None:
     FAISS_INDEX_PATH.parent.mkdir(parents=True, exist_ok=True)
     DOCSTORE_PATH.parent.mkdir(parents=True, exist_ok=True)
 
+
+def _new_index() -> faiss.Index:
+    """Create a fresh inner-product FAISS index."""
+    return faiss.IndexFlatIP(EMBEDDING_DIM)
+
+
+# ── Embedding ──────────────────────────────────────────────────────────────
 
 def load_embedding_model() -> SentenceTransformer:
     global _MODEL
@@ -37,24 +56,46 @@ def load_embedding_model() -> SentenceTransformer:
     return _MODEL
 
 
-def _new_index() -> faiss.Index:
-    return faiss.IndexFlatIP(EMBEDDING_DIM)
+def embed_texts(texts: Sequence[str]) -> np.ndarray:
+    """Embed a batch of texts, returns float32 array shaped (N, DIM)."""
+    model = load_embedding_model()
+    vecs = model.encode(
+        list(texts),
+        convert_to_numpy=True,
+        normalize_embeddings=True,   # enables cosine via inner-product
+        show_progress_bar=len(texts) > 20,
+    )
+    return np.asarray(vecs, dtype="float32")
 
+
+def embed_query(query: str) -> np.ndarray:
+    """Embed a single query string, returns float32 array shaped (1, DIM)."""
+    model = load_embedding_model()
+    vec = model.encode(
+        [query],
+        convert_to_numpy=True,
+        normalize_embeddings=True,
+    )
+    return np.asarray(vec, dtype="float32")
+
+
+# ── Index persistence ──────────────────────────────────────────────────────
 
 def _load_docstore() -> List[Dict[str, str]]:
     if not DOCSTORE_PATH.exists():
         return []
-    with DOCSTORE_PATH.open("r", encoding="utf-8") as handle:
-        return json.load(handle)
+    with DOCSTORE_PATH.open("r", encoding="utf-8") as fh:
+        return json.load(fh)
 
 
 def _save_docstore(docs: List[Dict[str, str]]) -> None:
     _ensure_dirs()
-    with DOCSTORE_PATH.open("w", encoding="utf-8") as handle:
-        json.dump(docs, handle, ensure_ascii=False, indent=2)
+    with DOCSTORE_PATH.open("w", encoding="utf-8") as fh:
+        json.dump(docs, fh, ensure_ascii=False, indent=2)
 
 
 def load_index() -> faiss.Index:
+    """Load (or create) the FAISS index and populate _DOCS."""
     global _INDEX, _DOCS
     if _INDEX is not None:
         return _INDEX
@@ -70,46 +111,50 @@ def load_index() -> faiss.Index:
 
 
 def save_index(index: faiss.Index, docs: List[Dict[str, str]]) -> None:
+    """Persist the FAISS index and docstore to disk."""
+    global _DOCS
     _ensure_dirs()
     faiss.write_index(index, str(FAISS_INDEX_PATH))
     _save_docstore(docs)
+    _DOCS = docs         # keep in-memory mirror in sync
 
 
-def embed_query(query: str) -> np.ndarray:
-    model = load_embedding_model()
-    vector = model.encode([query], convert_to_numpy=True, normalize_embeddings=True)
-    return np.asarray(vector, dtype="float32")
+# ── Search ─────────────────────────────────────────────────────────────────
 
-
-def embed_texts(texts: Sequence[str]) -> np.ndarray:
-    model = load_embedding_model()
-    vectors = model.encode(list(texts), convert_to_numpy=True, normalize_embeddings=True)
-    return np.asarray(vectors, dtype="float32")
-
-
-def search(query: str, top_k: int = 3) -> List[Dict[str, str]]:
+def search(query: str, top_k: int = 4) -> List[Dict[str, str]]:
+    """
+    Return top-k most relevant chunks for *query*.
+    Chunks with score < MIN_SCORE are discarded.
+    """
     index = load_index()
     if index.ntotal == 0:
         return []
 
-    query_vector = embed_query(query)
-    scores, ids = index.search(query_vector, top_k)
+    qvec = embed_query(query)
+    scores, ids = index.search(qvec, min(top_k, index.ntotal))
+
     results: List[Dict[str, str]] = []
     for doc_id, score in zip(ids[0], scores[0]):
         if doc_id < 0 or doc_id >= len(_DOCS):
             continue
+        if score < MIN_SCORE:
+            continue
         doc = dict(_DOCS[doc_id])
-        doc["score"] = float(score)
+        doc["score"] = round(float(score), 4)
         results.append(doc)
     return results
 
 
 def build_context(docs: Sequence[Dict[str, str]]) -> str:
+    """
+    Format retrieved docs into a numbered context block for the LLM prompt.
+    Deduplicates identical chunk texts.
+    """
     if not docs:
         return ""
 
     blocks: List[str] = []
-    seen = set()
+    seen: set = set()
     for i, doc in enumerate(docs, start=1):
         text = (doc.get("text") or "").strip()
         if not text or text in seen:
@@ -117,70 +162,89 @@ def build_context(docs: Sequence[Dict[str, str]]) -> str:
         seen.add(text)
         source = doc.get("source", "unknown")
         chunk_id = doc.get("chunk_id", str(i))
-        blocks.append(f"[Source {i}] {source} | Chunk {chunk_id}\n{text}")
+        score = doc.get("score", "?")
+        blocks.append(
+            f"--- Context [{i}] | Source: {source} | Chunk: {chunk_id} | Score: {score} ---\n{text}"
+        )
     return "\n\n".join(blocks)
 
 
+def index_stats() -> Dict[str, int]:
+    """Return total vectors stored and number of documents."""
+    index = load_index()
+    return {"vectors": int(index.ntotal), "chunks": len(_DOCS)}
+
+
+# ── Ollama client ──────────────────────────────────────────────────────────
+
 def _fetch_ollama_models() -> List[str]:
+    """Query Ollama for locally installed model names."""
     try:
-        response = requests.get(OLLAMA_TAGS_URL, timeout=10)
-        response.raise_for_status()
-        payload = response.json()
-        models = payload.get("models", [])
-        names = []
-        for item in models:
-            name = item.get("name")
-            if name:
-                names.append(name)
-        return names
+        resp = requests.get(OLLAMA_TAGS_URL, timeout=8)
+        resp.raise_for_status()
+        data = resp.json()
+        return [m["name"] for m in data.get("models", []) if m.get("name")]
     except requests.RequestException:
         return []
 
 
 def _available_models() -> List[str]:
     installed = _fetch_ollama_models()
-    if installed:
-        return installed
-    return FALLBACK_MODELS
+    return installed if installed else FALLBACK_MODELS
 
 
-def _build_messages(prompt: str, history: Optional[List[Dict[str, str]]] = None) -> List[Dict[str, str]]:
+def _build_messages(
+    prompt: str,
+    history: Optional[List[Dict[str, str]]] = None,
+) -> List[Dict[str, str]]:
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     if history:
-        for item in history[-5:]:
-            if item.get("role") in {"user", "assistant"} and item.get("content"):
-                messages.append({"role": item["role"], "content": item["content"]})
+        for msg in history:
+            role = msg.get("role")
+            content = msg.get("content", "").strip()
+            if role in {"user", "assistant"} and content:
+                messages.append({"role": role, "content": content})
     messages.append({"role": "user", "content": prompt})
     return messages
 
 
-def call_llm(prompt: str, history: Optional[List[Dict[str, str]]] = None, model: Optional[str] = None) -> str:
-    models_to_try = [model] if model else []
-    models_to_try.extend([name for name in _available_models() if name not in models_to_try])
-    if DEFAULT_MODEL not in models_to_try:
-        models_to_try.insert(0, DEFAULT_MODEL)
+def call_llm(
+    prompt: str,
+    history: Optional[List[Dict[str, str]]] = None,
+    model: Optional[str] = None,
+) -> str:
+    """
+    Call the local Ollama LLM.
+    Tries the specified model first, then falls back through available models.
+    Raises RuntimeError if nothing responds.
+    """
+    candidates = []
+    if model:
+        candidates.append(model)
+    available = _available_models()
+    for m in available:
+        if m not in candidates:
+            candidates.append(m)
+    if DEFAULT_MODEL not in candidates:
+        candidates.insert(0, DEFAULT_MODEL)
 
-    payload_messages = _build_messages(prompt, history=history)
+    messages = _build_messages(prompt, history=history)
     last_error: Optional[str] = None
 
-    for candidate in models_to_try:
-        if not candidate:
-            continue
-        body = {"model": candidate, "messages": payload_messages, "stream": False}
+    for candidate in candidates:
+        body = {"model": candidate, "messages": messages, "stream": False}
         try:
-            response = requests.post(OLLAMA_URL, json=body, timeout=REQUEST_TIMEOUT)
-            response.raise_for_status()
-            data = response.json()
-            message = data.get("message", {})
-            content = message.get("content", "").strip()
+            resp = requests.post(OLLAMA_URL, json=body, timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            content = resp.json().get("message", {}).get("content", "").strip()
             if content:
                 return content
-            last_error = f"Ollama returned an empty response for model '{candidate}'."
+            last_error = f"Empty response from '{candidate}'."
         except requests.RequestException as exc:
-            last_error = f"{candidate}: {exc}"
+            last_error = str(exc)
 
     raise RuntimeError(
-        "Could not reach Ollama or no model responded successfully. "
-        f"Last error: {last_error}"
+        "Ollama is unreachable or no installed model responded.\n"
+        f"Last error: {last_error}\n"
+        "Make sure Ollama is running:  ollama serve"
     )
-
