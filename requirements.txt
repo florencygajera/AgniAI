@@ -1,0 +1,7 @@
+faiss-cpu
+sentence-transformers
+requests
+PyMuPDF
+beautifulsoup4
+numpy
+fastapi 
