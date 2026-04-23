@@ -25,7 +25,9 @@ import sys
 import textwrap
 from typing import Optional
 
-from config import DATA_DIR, INDEX_DIR, TOP_K
+import requests
+
+from config import DATA_DIR, INDEX_DIR, TOP_K, SYSTEM_PROMPT
 from ingest import (
     clear_index,
     ingest_docx,
@@ -36,7 +38,14 @@ from ingest import (
     list_sources,
 )
 from memory import ConversationMemory
-from rag import build_context, call_llm, index_stats, search
+from ollama_cpu_chat import MODEL_NAME as DEFAULT_MODEL_NAME
+from ollama_cpu_chat import PartialResponseError, chat_with_fallback
+from rag import build_context, index_stats, search
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 
 # ── ANSI colour helpers ────────────────────────────────────────────────────
@@ -86,6 +95,24 @@ HELP_TEXT = f"""
 def _ensure_dirs() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     INDEX_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _should_use_rag(query: str) -> bool:
+    """
+    Skip retrieval for tiny greetings and pure small-talk.
+    That keeps CPU prompts short when the user is not asking for facts.
+    """
+    q = query.strip().lower()
+    greetings = {
+        "hi",
+        "hello",
+        "hey",
+        "thanks",
+        "thank you",
+        "ok",
+        "okay",
+    }
+    return q not in greetings and len(q.split()) > 2
 
 
 # ── Command handlers ───────────────────────────────────────────────────────
@@ -174,7 +201,8 @@ def _wrap_answer(text: str, width: int = 80) -> str:
 def run_chat() -> None:
     _ensure_dirs()
     memory = ConversationMemory()
-    active_model: Optional[str] = None   # None → auto-detect from Ollama
+    active_model: Optional[str] = DEFAULT_MODEL_NAME
+    session = requests.Session()
 
     print(BANNER)
     stats = index_stats()
@@ -244,11 +272,16 @@ def run_chat() -> None:
             continue
 
         # ── RAG pipeline ───────────────────────────────────────────────────
-        print(dim("  🔍 Searching knowledge base…"))
-        docs = search(raw, top_k=TOP_K)
-        context = build_context(docs)
+        use_rag = _should_use_rag(raw)
+        context = ""
+        if use_rag:
+            print(dim("  🔍 Searching knowledge base…"))
+            docs = search(raw, top_k=min(TOP_K, 2))
+            context = build_context(docs)
+            if len(context) > 3000:
+                context = context[:3000].rstrip() + "\n...[truncated]..."
 
-        if not context:
+        if use_rag and not context:
             no_info = ("I don't have that information in my knowledge base. "
                        "Please ingest the relevant document first using "
                        "/ingest pdf, /ingest url, /ingest docx, or /ingest text.")
@@ -260,19 +293,39 @@ def run_chat() -> None:
         print(dim("  🤖 Generating answer…"))
 
         history = memory.history()
-        prompt = (
-            f"Question: {raw}\n\n"
-            f"Retrieved context:\n{context}\n\n"
-            "Answer in a structured, concise format using ONLY the retrieved context above."
-        )
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        if history:
+            messages.extend(history[-4:])
+
+        if use_rag:
+            user_content = (
+                f"Question: {raw}\n\n"
+                f"Retrieved context:\n{context}\n\n"
+                "Answer in a structured, concise format using ONLY the retrieved context above."
+            )
+        else:
+            user_content = raw
+
+        messages.append({"role": "user", "content": user_content})
 
         try:
-            answer = call_llm(prompt, history=history, model=active_model)
+            print(f"\n{bold(blue('AgniAI'))}: ", end="", flush=True)
+            result = chat_with_fallback(
+                session,
+                active_model,
+                messages,
+                stream_tokens=True,
+            )
+            answer = result.text
+            print()
+        except PartialResponseError as exc:
+            print(f"\n{red('  ✘  LLM Error:')} {exc}\n")
+            answer = exc.partial_text
         except RuntimeError as exc:
             print(f"\n{red('  ✘  LLM Error:')} {exc}\n")
             continue
 
-        print(f"\n{bold(blue('AgniAI'))}:\n{_wrap_answer(answer)}\n")
+        print(f"{_wrap_answer(answer)}\n")
 
         memory.add("user", raw)
         memory.add("assistant", answer)
