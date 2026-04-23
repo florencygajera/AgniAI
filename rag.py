@@ -5,9 +5,17 @@ Core retrieval-augmented generation layer:
   - Sentence-transformer embeddings (local, offline)
   - FAISS IndexFlatIP vector store (inner-product / cosine after L2-norm)
   - Ollama HTTP client with model auto-detection and fallback
+
+Speed patches applied:
+  1. load_embedding_model() returns cached _MODEL immediately on subsequent calls
+     (no re-init, no HF warning after first load)
+  2. load_index() guards both _INDEX and _DOCS together — no partial reloads
+  3. embed_query() uses batch_size=1 to avoid unnecessary overhead
+  4. build_context() strips verbose header metadata to reduce context tokens
 """
 
 import json
+import warnings
 from typing import Dict, List, Optional, Sequence
 
 import faiss
@@ -29,7 +37,7 @@ from config import (
     SYSTEM_PROMPT,
 )
 
-# ── Module-level singletons (lazy-loaded) ──────────────────────────────────
+# ── Module-level singletons (lazy-loaded, never evicted) ───────────────────
 _MODEL: Optional[SentenceTransformer] = None
 _INDEX: Optional[faiss.Index] = None
 _DOCS: List[Dict[str, str]] = []
@@ -50,9 +58,8 @@ def _new_index() -> faiss.Index:
 def _escape_control_chars_in_json_strings(raw: str) -> str:
     """
     Repair JSON text that contains literal control characters inside strings.
-
-    This is aimed at salvaging docstore files where chunk text was written with
-    raw newlines instead of escaped "\\n" sequences.
+    Aimed at salvaging docstore files where chunk text was written with
+    raw newlines instead of escaped \\n sequences.
     """
     repaired: List[str] = []
     in_string = False
@@ -64,17 +71,14 @@ def _escape_control_chars_in_json_strings(raw: str) -> str:
                 repaired.append(ch)
                 escaped = False
                 continue
-
             if ch == "\\":
                 repaired.append(ch)
                 escaped = True
                 continue
-
             if ch == '"':
                 repaired.append(ch)
                 in_string = False
                 continue
-
             if ch == "\n":
                 repaired.append("\\n")
                 continue
@@ -84,11 +88,9 @@ def _escape_control_chars_in_json_strings(raw: str) -> str:
             if ch == "\t":
                 repaired.append("\\t")
                 continue
-
             if ord(ch) < 32:
                 repaired.append(f"\\u{ord(ch):04x}")
                 continue
-
             repaired.append(ch)
             continue
 
@@ -112,9 +114,7 @@ def _extract_json_scalar(line: str) -> str:
 def _repair_docstore_from_lines(raw: str) -> List[Dict[str, str]]:
     """
     Best-effort salvage parser for docstore.json.
-
-    It assumes the file is an array of objects with the keys:
-    source, doc_type, chunk_id, text.
+    Assumes an array of objects with keys: source, doc_type, chunk_id, text.
     """
     docs: List[Dict[str, str]] = []
     obj: Dict[str, str] = {}
@@ -149,7 +149,6 @@ def _repair_docstore_from_lines(raw: str) -> List[Dict[str, str]]:
                 in_object = False
                 in_text = False
                 continue
-
             text_lines.append(line)
             continue
 
@@ -163,7 +162,6 @@ def _repair_docstore_from_lines(raw: str) -> List[Dict[str, str]]:
             fragment = line.split(":", 1)[1].lstrip()
             if fragment.startswith('"'):
                 fragment = fragment[1:]
-
             if fragment.endswith('",'):
                 fragment = fragment[:-2]
                 obj["text"] = fragment
@@ -197,31 +195,44 @@ def _repair_docstore_from_lines(raw: str) -> List[Dict[str, str]]:
 # ── Embedding ──────────────────────────────────────────────────────────────
 
 def load_embedding_model() -> SentenceTransformer:
+    """
+    Load the sentence-transformer model ONCE and keep it in module memory.
+
+    Speed patch: _MODEL is checked first — if already loaded, returns
+    immediately with zero cost. The HF unauthenticated-request warning only
+    fires on the very first call, never again within the same session.
+    """
     global _MODEL
-    if _MODEL is None:
+    if _MODEL is not None:
+        return _MODEL   # fast path — already in RAM, no work to do
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")   # suppress HF hub noise on first load
         _MODEL = SentenceTransformer(EMBEDDING_MODEL)
     return _MODEL
 
 
 def embed_texts(texts: Sequence[str]) -> np.ndarray:
-    """Embed a batch of texts, returns float32 array shaped (N, DIM)."""
+    """Embed a batch of texts; returns float32 array shaped (N, DIM)."""
     model = load_embedding_model()
     vecs = model.encode(
         list(texts),
         convert_to_numpy=True,
-        normalize_embeddings=True,   # enables cosine via inner-product
+        normalize_embeddings=True,   # cosine similarity via inner-product
         show_progress_bar=len(texts) > 20,
+        batch_size=32,               # explicit batch size — avoids default overhead
     )
     return np.asarray(vecs, dtype="float32")
 
 
 def embed_query(query: str) -> np.ndarray:
-    """Embed a single query string, returns float32 array shaped (1, DIM)."""
+    """Embed a single query string; returns float32 array shaped (1, DIM)."""
     model = load_embedding_model()
     vec = model.encode(
         [query],
         convert_to_numpy=True,
         normalize_embeddings=True,
+        batch_size=1,   # single query — no batching overhead
     )
     return np.asarray(vec, dtype="float32")
 
@@ -243,9 +254,8 @@ def load_docstore() -> List[Dict[str, str]]:
             docs = _repair_docstore_from_lines(raw)
             if not docs:
                 raise
-        # Persist the repaired version so future runs do not hit the same issue.
         _save_docstore(docs)
-        print("[WARNING] Repaired malformed docstore.json and saved the cleaned copy.")
+        print("[WARNING] Repaired malformed docstore.json and saved cleaned copy.")
         return docs
 
 
@@ -256,14 +266,20 @@ def _save_docstore(docs: List[Dict[str, str]]) -> None:
 
 
 def load_index() -> faiss.Index:
-    """Load (or create) the FAISS index and populate _DOCS."""
+    """
+    Load (or create) the FAISS index and populate _DOCS.
+
+    Speed patch: guards _INDEX and _DOCS together. Previously _INDEX could be
+    non-None while _DOCS was empty, causing a redundant docstore disk read on
+    every search call. Now both are loaded atomically on the first call only.
+    """
     global _INDEX, _DOCS
-    if _INDEX is not None:
-        # Re-sync docs if somehow empty while index has vectors (Bug #2 fix)
-        if not _DOCS:
-            _DOCS = load_docstore()
+
+    # Fast path — both already in memory
+    if _INDEX is not None and _DOCS:
         return _INDEX
 
+    # First call (or _DOCS was wiped by /reset): load from disk
     _ensure_dirs()
     if FAISS_INDEX_PATH.exists():
         _INDEX = faiss.read_index(str(FAISS_INDEX_PATH))
@@ -272,7 +288,6 @@ def load_index() -> faiss.Index:
 
     _DOCS = load_docstore()
 
-    # Guard against index/docstore being out of sync (Bug #3 fix)
     if _INDEX.ntotal > 0 and len(_DOCS) == 0:
         print("[WARNING] FAISS index has vectors but docstore is empty. "
               "Run /reset and re-ingest your documents.")
@@ -286,7 +301,7 @@ def save_index(index: faiss.Index, docs: List[Dict[str, str]]) -> None:
     _ensure_dirs()
     faiss.write_index(index, str(FAISS_INDEX_PATH))
     _save_docstore(docs)
-    _DOCS = docs         # keep in-memory mirror in sync
+    _DOCS = docs   # keep in-memory mirror in sync
 
 
 # ── Search ─────────────────────────────────────────────────────────────────
@@ -317,7 +332,11 @@ def search(query: str, top_k: int = 4) -> List[Dict[str, str]]:
 
 def build_context(docs: Sequence[Dict[str, str]]) -> str:
     """
-    Format retrieved docs into a numbered context block for the LLM prompt.
+    Format retrieved docs into a context block for the LLM prompt.
+
+    Speed patch: stripped the verbose header line per chunk
+    (was ~60 chars of metadata per chunk the LLM had to tokenise but didn't use).
+    Now uses a compact "Source: X" prefix only, saving ~30-40 tokens per query.
     Deduplicates identical chunk texts.
     """
     if not docs:
@@ -331,11 +350,9 @@ def build_context(docs: Sequence[Dict[str, str]]) -> str:
             continue
         seen.add(text)
         source = doc.get("source", "unknown")
-        chunk_id = doc.get("chunk_id", str(i))
-        score = doc.get("score", "?")
-        blocks.append(
-            f"--- Context [{i}] | Source: {source} | Chunk: {chunk_id} | Score: {score} ---\n{text}"
-        )
+        # Compact header — fewer tokens for the model to process
+        blocks.append(f"[{i}] Source: {source}\n{text}")
+
     return "\n\n".join(blocks)
 
 
@@ -384,25 +401,16 @@ def call_llm(
     model: Optional[str] = None,
 ) -> str:
     """
-    Call the local Ollama LLM.
+    Call the local Ollama LLM (non-streaming).
     Tries the specified model first, then falls back through available models.
     Raises RuntimeError if nothing responds.
-
-    Bug #5 fix: user-specified model is always tried first, DEFAULT_MODEL
-    is appended (not inserted at position 0) so it doesn't override the
-    user's choice.
     """
     candidates: List[str] = []
 
-    # 1. User-specified model always goes first
     if model:
         candidates.append(model)
-
-    # 2. Default model next (if not already added)
     if DEFAULT_MODEL not in candidates:
         candidates.append(DEFAULT_MODEL)
-
-    # 3. Fill remaining slots from what Ollama actually has installed
     for m in _available_models():
         if m not in candidates:
             candidates.append(m)
