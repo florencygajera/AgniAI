@@ -82,22 +82,22 @@ BANNER = cyan(r"""
 """) + bold("  Agniveer AI Assistant  — Offline · Local · Private\n")
 
 HELP_TEXT = f"""
-{bold("Available commands:")}
+Available commands:
 
-  {cyan("/ingest pdf  <path>")}     Add a PDF to the knowledge base
-  {cyan("/ingest url  <url>")}      Add a web page to the knowledge base
-  {cyan("/ingest txt  <path>")}     Add a plain .txt file
-  {cyan("/ingest text <content>")}  Add raw text
-  {cyan("/ingest docx <path>")}     Add a Word (.docx) file
-  {cyan("/sources")}                List all ingested sources
-  {cyan("/stats")}                  Show index vector count
-  {cyan("/clear")}                  Clear conversation memory
-  {cyan("/reset")}                  ⚠  Delete the entire knowledge base
-  {cyan("/model <name>")}           Switch the Ollama model (e.g. phi3:mini)
-  {cyan("/help")}                   Show this help
-  {cyan("/exit")}  or  {cyan("/quit")}        Exit AgniAI
+  /ingest pdf  <path>     Add a PDF to the knowledge base
+  /ingest url  <url>      Add a web page to the knowledge base
+  /ingest txt  <path>     Add a plain .txt file
+  /ingest text <content>  Add raw text
+  /ingest docx <path>     Add a Word (.docx) file
+  /sources                List all ingested sources
+  /stats                  Show index vector count
+  /clear                  Clear conversation memory
+  /reset                  Delete the entire knowledge base
+  /model <name>           Switch the Ollama model (e.g. phi3:mini)
+  /help                   Show this help
+  /exit  or  /quit        Exit AgniAI
 
-{bold("Recommended small models for CPU:")}
+Recommended small models for CPU:
   ollama pull phi3:mini      (~2.3 GB)
   ollama pull llama3.2:3b   (~2.0 GB)
   ollama pull gemma2:2b     (~1.6 GB)
@@ -112,16 +112,14 @@ def _ensure_dirs() -> None:
 
 
 def _should_use_rag(query: str) -> bool:
-    """Skip RAG for greetings and pure small-talk so the model responds naturally."""
+    """Skip RAG for greetings and pure small-talk."""
     q = query.strip().lower()
-    # Single words or common greetings — no need to hit the vector index
     greetings = {
         "hi", "hello", "hey", "thanks", "thank you", "ok", "okay", "bye",
         "good morning", "good evening", "good afternoon", "greetings",
     }
     if q in greetings:
         return False
-    # Very short inputs (≤ 2 words) are unlikely to be factual queries
     if len(q.split()) <= 2:
         return False
     return True
@@ -143,7 +141,7 @@ def _handle_ingest(command: str) -> None:
     target = parts[2].strip()
 
     try:
-        print(dim(f"  ⏳ Ingesting {kind}…"))
+        print(dim(f"  Ingesting {kind}..."))
         if kind == "pdf":
             count = ingest_pdf(target)
         elif kind == "url":
@@ -159,13 +157,13 @@ def _handle_ingest(command: str) -> None:
             return
 
         if count == 0:
-            print(yellow("  ⚠  Source already ingested (use /reset to re-ingest)."))
+            print(yellow("  Source already ingested (use /reset to re-ingest)."))
         else:
-            print(green(f"  ✔  Ingested {count} chunk(s) successfully."))
+            print(green(f"  Ingested {count} chunk(s) successfully."))
     except FileNotFoundError as exc:
-        print(red(f"  ✘  File not found: {exc}"))
+        print(red(f"  File not found: {exc}"))
     except Exception as exc:
-        print(red(f"  ✘  Ingestion failed: {exc}"))
+        print(red(f"  Ingestion failed: {exc}"))
 
 
 def _handle_sources() -> None:
@@ -173,45 +171,30 @@ def _handle_sources() -> None:
     if not sources:
         print(yellow("  No sources ingested yet."))
         return
-    print(bold(f"\n  📚 Ingested Sources ({len(sources)} total):"))
+    print(bold(f"\n  Ingested Sources ({len(sources)} total):"))
     for s in sources:
         chunk_info = dim(f"({s['chunk_count']} chunks)")
-        print(f"    {cyan('•')} [{s['doc_type'].upper()}] {s['source']}  {chunk_info}")
+        print(f"    - [{s['doc_type'].upper()}] {s['source']}  {chunk_info}")
 
 
 def _handle_stats() -> None:
     stats = index_stats()
     print(
-        f"\n  {bold('Index stats:')}  "
-        f"{cyan(str(stats['vectors']))} vectors  ·  "
-        f"{cyan(str(stats['chunks']))} chunks"
+        f"\n  Index stats: "
+        f"{stats['vectors']} vectors  /  "
+        f"{stats['chunks']} chunks"
     )
 
 
 def _handle_reset() -> None:
     confirm = input(
-        yellow("  ⚠  This will DELETE the entire knowledge base. Type YES to confirm: ")
+        yellow("  This will DELETE the entire knowledge base. Type YES to confirm: ")
     ).strip()
     if confirm == "YES":
         clear_index()
-        print(green("  ✔  Knowledge base cleared."))
+        print(green("  Knowledge base cleared."))
     else:
         print(dim("  Reset cancelled."))
-
-
-# ── Formatting ─────────────────────────────────────────────────────────────
-
-def _wrap_answer(text: str, width: int = 80) -> str:
-    lines = text.splitlines()
-    wrapped = []
-    for line in lines:
-        stripped = line.lstrip()
-        indent   = len(line) - len(stripped)
-        prefix   = " " * indent
-        wrapped.append(
-            textwrap.fill(line, width=width, subsequent_indent=prefix + "  ")
-        )
-    return "\n".join(wrapped)
 
 
 # ── Main chat loop ─────────────────────────────────────────────────────────
@@ -227,7 +210,7 @@ def run_chat() -> None:
     stats = index_stats()
     if stats["vectors"] == 0:
         print(yellow(
-            "  ℹ  Knowledge base is empty.  "
+            "  Knowledge base is empty.  "
             "Use /ingest to add PDFs, URLs, or text.\n"
         ))
     else:
@@ -239,9 +222,9 @@ def run_chat() -> None:
     while True:
         # ── Input ──────────────────────────────────────────────────────────
         try:
-            raw = input(f"{bold(cyan('You'))}: ").strip()
+            raw = input(f"You: ").strip()
         except (EOFError, KeyboardInterrupt):
-            print(f"\n{dim('Goodbye.')}")
+            print(f"\nGoodbye.")
             break
 
         if not raw:
@@ -251,7 +234,7 @@ def run_chat() -> None:
 
         # ── Built-in commands ──────────────────────────────────────────────
         if low in {"/exit", "/quit"}:
-            print(dim("Goodbye."))
+            print("Goodbye.")
             break
 
         if low == "/help":
@@ -268,7 +251,7 @@ def run_chat() -> None:
 
         if low == "/clear":
             memory.clear()
-            print(green("  ✔  Conversation memory cleared."))
+            print(green("  Conversation memory cleared."))
             continue
 
         if low == "/reset":
@@ -279,7 +262,7 @@ def run_chat() -> None:
             parts = raw.split(maxsplit=1)
             if len(parts) == 2 and parts[1].strip():
                 active_model = parts[1].strip()
-                print(green(f"  ✔  Model switched to '{active_model}'."))
+                print(green(f"  Model switched to '{active_model}'."))
             else:
                 print(yellow("  Usage: /model <model-name>  e.g.  /model phi3:mini"))
             continue
@@ -296,10 +279,10 @@ def run_chat() -> None:
         use_rag = _should_use_rag(raw)
         context = ""
         if use_rag:
-            print(dim("  🔍 Searching knowledge base…"))
-            docs    = search(raw, top_k=min(TOP_K, 2))
+            print(dim("  Searching knowledge base..."))
+            # Use full TOP_K (3) to pull all relevant chunks, not just 2
+            docs    = search(raw, top_k=TOP_K)
             context = build_context(docs)
-            # Hard-cap context to keep the prompt tiny (key for CPU speed)
             if len(context) > MAX_CONTEXT_CHARS:
                 context = context[:MAX_CONTEXT_CHARS].rstrip() + "\n...[truncated]..."
 
@@ -309,30 +292,34 @@ def run_chat() -> None:
                 "Please ingest the relevant document first using "
                 "/ingest pdf, /ingest url, /ingest docx, or /ingest text."
             )
-            print(f"\n{bold(blue('AgniAI'))}: {yellow(no_info)}\n")
+            print(f"\nAgniAI: {no_info}\n")
             memory.add("user",      raw)
             memory.add("assistant", no_info)
             continue
 
-        print(dim("  🤖 Generating answer…"))
+        print(dim("  Generating answer..."))
 
-        history  = memory.history()
+        history = memory.history()
 
         if use_rag:
-            # RAG path: inject system prompt + context as reference text
+            # RAG path: system prompt + clearly delimited reference text
             messages = [{"role": "system", "content": SYSTEM_PROMPT}]
             if history:
                 messages.extend(history[-4:])
             user_content = (
-                f"=== REFERENCE TEXT (answer from this) ===\n"
+                f"=== REFERENCE TEXT ===\n"
                 f"{context}\n"
                 f"=== END REFERENCE TEXT ===\n\n"
                 f"Question: {raw}\n\n"
-                f"Answer the question using the reference text above."
+                f"Answer the question using ONLY the reference text above. "
+                f"List all relevant points. End with the source."
             )
         else:
-            # Small-talk / greeting path: no context, minimal system prompt
-            messages = [{"role": "system", "content": "You are AgniAI, a helpful assistant for Agniveer recruitment. Respond naturally and concisely."}]
+            # Greeting / small-talk path: no RAG, minimal prompt
+            messages = [{"role": "system", "content": (
+                "You are AgniAI, a helpful assistant for India's Agniveer "
+                "recruitment scheme. Respond naturally and concisely."
+            )}]
             if history:
                 messages.extend(history[-4:])
             user_content = raw
@@ -340,8 +327,11 @@ def run_chat() -> None:
         messages.append({"role": "user", "content": user_content})
 
         # ── LLM call ───────────────────────────────────────────────────────
+        # IMPORTANT: stream_tokens=True means every token is printed to stdout
+        # as it arrives inside chat_with_fallback. Do NOT print answer again
+        # after this block — that is what caused the duplicate output bug.
         try:
-            print(f"\n{bold(blue('AgniAI'))}: ", end="", flush=True)
+            print(f"\nAgniAI: ", end="", flush=True)
             result = chat_with_fallback(
                 session,
                 active_model,
@@ -349,16 +339,17 @@ def run_chat() -> None:
                 stream_tokens=True,
             )
             answer = result.text
-            print()   # newline after streamed tokens
+            print("\n")   # blank line after the streamed answer
         except PartialResponseError as exc:
-            print(f"\n{red('  ✘  Partial response:')} {exc}\n")
+            print(f"\n  Partial response: {exc}\n")
             answer = exc.partial_text
+            if answer:
+                print(f"{answer}\n")
         except RuntimeError as exc:
-            print(f"\n{red('  ✘  LLM Error:')} {exc}\n")
+            print(f"\n  LLM Error: {exc}\n")
             continue
 
-        print(f"{_wrap_answer(answer)}\n")
-
+        # Tokens were already printed live above — only save to memory here
         memory.add("user",      raw)
         memory.add("assistant", answer)
 
