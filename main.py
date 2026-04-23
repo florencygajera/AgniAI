@@ -11,6 +11,7 @@ Commands (during chat):
     /ingest url  <url>     — Add a web page to the knowledge base
     /ingest txt  <path>    — Add a plain .txt file to the knowledge base
     /ingest text <content> — Add raw text to the knowledge base
+    /ingest docx <path>    — Add a Word (.docx) file to the knowledge base
     /sources               — List all ingested sources
     /stats                 — Show index statistics
     /clear                 — Clear the conversation memory
@@ -25,7 +26,15 @@ import textwrap
 from typing import Optional
 
 from config import DATA_DIR, INDEX_DIR, TOP_K
-from ingest import clear_index, ingest_pdf, ingest_text, ingest_txt, ingest_url, ingest_docx, list_sources
+from ingest import (
+    clear_index,
+    ingest_docx,
+    ingest_pdf,
+    ingest_text,
+    ingest_txt,
+    ingest_url,
+    list_sources,
+)
 from memory import ConversationMemory
 from rag import build_context, call_llm, index_stats, search
 
@@ -38,13 +47,13 @@ def _c(code: str, text: str) -> str:
         return text
     return f"\033[{code}m{text}\033[0m"
 
-def dim(t: str) -> str:   return _c("2", t)
-def bold(t: str) -> str:  return _c("1", t)
-def cyan(t: str) -> str:  return _c("96", t)
-def green(t: str) -> str: return _c("92", t)
-def yellow(t: str) -> str:return _c("93", t)
-def red(t: str) -> str:   return _c("91", t)
-def blue(t: str) -> str:  return _c("94", t)
+def dim(t: str) -> str:    return _c("2", t)
+def bold(t: str) -> str:   return _c("1", t)
+def cyan(t: str) -> str:   return _c("96", t)
+def green(t: str) -> str:  return _c("92", t)
+def yellow(t: str) -> str: return _c("93", t)
+def red(t: str) -> str:    return _c("91", t)
+def blue(t: str) -> str:   return _c("94", t)
 
 
 BANNER = cyan(r"""
@@ -57,17 +66,18 @@ BANNER = cyan(r"""
 HELP_TEXT = f"""
 {bold("Available commands:")}
 
-  {cyan("/ingest pdf  <path>")}    Add a PDF to the knowledge base
-  {cyan("/ingest url  <url>")}     Add a web page to the knowledge base
-  {cyan("/ingest txt  <path>")}    Add a plain .txt file to the knowledge base
-  {cyan("/ingest text <content>")} Add raw text to the knowledge base
-  {cyan("/sources")}               List all ingested sources
-  {cyan("/stats")}                 Show index vector count
-  {cyan("/clear")}                 Clear conversation memory
-  {cyan("/reset")}                 ⚠  Delete the entire knowledge base
-  {cyan("/model <name>")}          Switch the Ollama model (e.g. mistral)
-  {cyan("/help")}                  Show this help message
-  {cyan("/exit")}  or  {cyan("/quit")}       Exit AgniAI
+  {cyan("/ingest pdf  <path>")}     Add a PDF to the knowledge base
+  {cyan("/ingest url  <url>")}      Add a web page to the knowledge base
+  {cyan("/ingest txt  <path>")}     Add a plain .txt file to the knowledge base
+  {cyan("/ingest text <content>")}  Add raw text to the knowledge base
+  {cyan("/ingest docx <path>")}     Add a Word (.docx) file to the knowledge base
+  {cyan("/sources")}                List all ingested sources
+  {cyan("/stats")}                  Show index vector count
+  {cyan("/clear")}                  Clear conversation memory
+  {cyan("/reset")}                  ⚠  Delete the entire knowledge base
+  {cyan("/model <name>")}           Switch the Ollama model (e.g. mistral)
+  {cyan("/help")}                   Show this help message
+  {cyan("/exit")}  or  {cyan("/quit")}        Exit AgniAI
 """
 
 
@@ -101,7 +111,7 @@ def _handle_ingest(command: str) -> None:
             count = ingest_txt(target)
         elif kind == "text":
             count = ingest_text(target)
-        elif kind == "docx":                  
+        elif kind == "docx":
             count = ingest_docx(target)
         else:
             print(yellow(f"  Unknown type '{kind}'. Use: pdf, url, txt, text, or docx."))
@@ -151,7 +161,6 @@ def _wrap_answer(text: str, width: int = 80) -> str:
     lines = text.splitlines()
     wrapped = []
     for line in lines:
-        # Don't wrap bullet/numbered lines at start — just indent them
         stripped = line.lstrip()
         indent = len(line) - len(stripped)
         prefix = " " * indent
@@ -216,7 +225,8 @@ def run_chat() -> None:
             _handle_reset()
             continue
 
-        if low.startswith("/model "):
+        # Bug #6 fix: match "/model" with or without trailing space
+        if low.startswith("/model"):
             parts = raw.split(maxsplit=1)
             if len(parts) == 2 and parts[1].strip():
                 active_model = parts[1].strip()
@@ -241,7 +251,7 @@ def run_chat() -> None:
         if not context:
             no_info = ("I don't have that information in my knowledge base. "
                        "Please ingest the relevant document first using "
-                       "/ingest pdf, /ingest url, or /ingest text.")
+                       "/ingest pdf, /ingest url, /ingest docx, or /ingest text.")
             print(f"\n{bold(blue('AgniAI'))}: {yellow(no_info)}\n")
             memory.add("user", raw)
             memory.add("assistant", no_info)

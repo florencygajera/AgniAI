@@ -98,6 +98,9 @@ def load_index() -> faiss.Index:
     """Load (or create) the FAISS index and populate _DOCS."""
     global _INDEX, _DOCS
     if _INDEX is not None:
+        # Re-sync docs if somehow empty while index has vectors (Bug #2 fix)
+        if not _DOCS:
+            _DOCS = _load_docstore()
         return _INDEX
 
     _ensure_dirs()
@@ -107,6 +110,12 @@ def load_index() -> faiss.Index:
         _INDEX = _new_index()
 
     _DOCS = _load_docstore()
+
+    # Guard against index/docstore being out of sync (Bug #3 fix)
+    if _INDEX.ntotal > 0 and len(_DOCS) == 0:
+        print("[WARNING] FAISS index has vectors but docstore is empty. "
+              "Run /reset and re-ingest your documents.")
+
     return _INDEX
 
 
@@ -217,16 +226,25 @@ def call_llm(
     Call the local Ollama LLM.
     Tries the specified model first, then falls back through available models.
     Raises RuntimeError if nothing responds.
+
+    Bug #5 fix: user-specified model is always tried first, DEFAULT_MODEL
+    is appended (not inserted at position 0) so it doesn't override the
+    user's choice.
     """
-    candidates = []
+    candidates: List[str] = []
+
+    # 1. User-specified model always goes first
     if model:
         candidates.append(model)
-    available = _available_models()
-    for m in available:
+
+    # 2. Default model next (if not already added)
+    if DEFAULT_MODEL not in candidates:
+        candidates.append(DEFAULT_MODEL)
+
+    # 3. Fill remaining slots from what Ollama actually has installed
+    for m in _available_models():
         if m not in candidates:
             candidates.append(m)
-    if DEFAULT_MODEL not in candidates:
-        candidates.insert(0, DEFAULT_MODEL)
 
     messages = _build_messages(prompt, history=history)
     last_error: Optional[str] = None

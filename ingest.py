@@ -2,7 +2,7 @@
 ingest.py
 =========
 Ingestion pipeline for AgniAI.
-Supports: PDF files, web URLs, raw text strings, and .txt files.
+Supports: PDF files, web URLs, raw text strings, .txt files, and .docx files.
 
 All content is:
   1. Extracted → cleaned → chunked (word-level sliding window)
@@ -14,10 +14,11 @@ import json
 import re
 from pathlib import Path
 from typing import Dict, List, Sequence
-from docx import Document as DocxDocument
+
 import fitz          # PyMuPDF
 import requests
 from bs4 import BeautifulSoup
+from docx import Document as DocxDocument
 
 from config import (
     CHUNK_OVERLAP,
@@ -95,6 +96,9 @@ def _append_documents(
     """
     Embed *chunks* and append them to the FAISS index + docstore.
     Returns number of chunks actually added.
+
+    Bug #4 fix: chunk_id now continues from the last stored ID instead
+    of always restarting at 1, so IDs are globally unique across ingestions.
     """
     if not chunks:
         return 0
@@ -113,7 +117,10 @@ def _append_documents(
         )
 
     index.add(vectors)
-    for i, chunk in enumerate(chunks, start=1):
+
+    # Continue chunk IDs from the last stored entry (globally unique IDs)
+    start_id = len(docs) + 1
+    for i, chunk in enumerate(chunks, start=start_id):
         docs.append(
             {
                 "source": source,
@@ -181,6 +188,28 @@ def ingest_txt(file_path: str, force: bool = False) -> int:
     return _append_documents(chunks, source=source, doc_type="txt")
 
 
+def ingest_docx(file_path: str, force: bool = False) -> int:
+    """Ingest a Microsoft Word (.docx) file."""
+    path = Path(file_path).expanduser().resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"Word file not found: {path}")
+    if path.suffix.lower() != ".docx":
+        raise ValueError(f"Expected a .docx file, got: {path.suffix}")
+
+    source = str(path)
+    if not force and _source_already_ingested(source):
+        return 0
+
+    doc = DocxDocument(str(path))
+    paragraphs = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+    text = clean_text("\n".join(paragraphs))
+    if not text:
+        raise ValueError("No extractable text found in the Word document.")
+
+    chunks = chunk_text(text)
+    return _append_documents(chunks, source=source, doc_type="docx")
+
+
 def ingest_url(url: str, force: bool = False) -> int:
     """
     Fetch a webpage, extract visible text, and add it to the knowledge base.
@@ -214,30 +243,21 @@ def ingest_url(url: str, force: bool = False) -> int:
 
 
 def ingest_text(text: str, label: str = "manual_text") -> int:
-    """Ingest raw text directly (e.g. pasted content)."""
+    """
+    Ingest raw text directly (e.g. pasted content).
+
+    Bug fix: each call now gets a unique label using a counter suffix,
+    so multiple raw-text ingestions don't block each other via deduplication.
+    """
+    # Make label unique if "manual_text" default is used multiple times
+    if label == "manual_text":
+        docs = _load_docstore()
+        existing = sum(1 for d in docs if d.get("source", "").startswith("manual_text"))
+        if existing > 0:
+            label = f"manual_text_{existing + 1}"
+
     chunks = chunk_text(text)
     return _append_documents(chunks, source=label, doc_type="text")
-
-def ingest_docx(file_path: str, force: bool = False) -> int:
-    """Ingest a Microsoft Word (.docx) file."""
-    path = Path(file_path).expanduser().resolve()
-    if not path.exists():
-        raise FileNotFoundError(f"Word file not found: {path}")
-    if path.suffix.lower() != ".docx":
-        raise ValueError(f"Expected a .docx file, got: {path.suffix}")
-
-    source = str(path)
-    if not force and _source_already_ingested(source):
-        return 0
-
-    doc = DocxDocument(str(path))
-    paragraphs = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
-    text = clean_text("\n".join(paragraphs))
-    if not text:
-        raise ValueError("No extractable text found in the Word document.")
-
-    chunks = chunk_text(text)
-    return _append_documents(chunks, source=source, doc_type="docx")
 
 
 def list_sources() -> List[Dict[str, str]]:
@@ -259,10 +279,10 @@ def clear_index() -> None:
     """
     Delete all indexed data (FAISS + docstore).
     Use with caution — requires re-ingestion of all sources.
-    """
-    from rag import _INDEX, _DOCS
-    import faiss as _faiss
 
+    Bug #1 fix: removed unused imports (_INDEX, _DOCS, faiss as _faiss).
+    Module-level singletons in rag.py are reset directly via the rag module.
+    """
     if FAISS_INDEX_PATH.exists():
         FAISS_INDEX_PATH.unlink()
     if DOCSTORE_PATH.exists():

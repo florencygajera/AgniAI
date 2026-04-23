@@ -24,7 +24,7 @@ CHUNK_OVERLAP = 50
 
 # ── Retrieval ──────────────────────────────────────────────────────────────
 TOP_K = 4
-MIN_SCORE = 0.15          # discard chunks below this cosine similarity
+MIN_SCORE = 0.05          # lowered from 0.15 — avoids silently discarding weak but relevant chunks
 
 # ── Memory ─────────────────────────────────────────────────────────────────
 MEMORY_MAX_MESSAGES = 10  # keeps last 5 exchanges (user + assistant each)
