@@ -6,6 +6,10 @@ AgniAI — Offline CLI chatbot for Agniveer recruitment queries.
 Run:
     python main.py
 
+TIP — For fast responses on CPU-only hardware, install a small model first:
+    ollama pull phi3:mini      (~2.3 GB, very fast on CPU)
+    ollama pull llama3.2:3b    (~2.0 GB, good quality)
+
 Commands (during chat):
     /ingest pdf  <path>    — Add a PDF file to the knowledge base
     /ingest url  <url>     — Add a web page to the knowledge base
@@ -27,7 +31,13 @@ from typing import Optional
 
 import requests
 
-from config import DATA_DIR, INDEX_DIR, TOP_K, SYSTEM_PROMPT
+from config import (
+    DATA_DIR,
+    INDEX_DIR,
+    MAX_CONTEXT_CHARS,
+    SYSTEM_PROMPT,
+    TOP_K,
+)
 from ingest import (
     clear_index,
     ingest_docx,
@@ -51,13 +61,12 @@ if hasattr(sys.stderr, "reconfigure"):
 # ── ANSI colour helpers ────────────────────────────────────────────────────
 
 def _c(code: str, text: str) -> str:
-    """Wrap *text* in an ANSI colour code (disabled on non-tty)."""
     if not sys.stdout.isatty():
         return text
     return f"\033[{code}m{text}\033[0m"
 
-def dim(t: str) -> str:    return _c("2", t)
-def bold(t: str) -> str:   return _c("1", t)
+def dim(t: str) -> str:    return _c("2",  t)
+def bold(t: str) -> str:   return _c("1",  t)
 def cyan(t: str) -> str:   return _c("96", t)
 def green(t: str) -> str:  return _c("92", t)
 def yellow(t: str) -> str: return _c("93", t)
@@ -66,7 +75,7 @@ def blue(t: str) -> str:   return _c("94", t)
 
 
 BANNER = cyan(r"""
-   ___                  _ ___    ___ 
+   ___                  _ ___    ___
   / _ |___  ___ _  ___ (_) _ \  / _ \
  / __ / _ \/ _ \ |/ _ \| | | | | (_) |
 /_/ |_\___/_//_/___|___/|_|___/  \___/
@@ -77,16 +86,21 @@ HELP_TEXT = f"""
 
   {cyan("/ingest pdf  <path>")}     Add a PDF to the knowledge base
   {cyan("/ingest url  <url>")}      Add a web page to the knowledge base
-  {cyan("/ingest txt  <path>")}     Add a plain .txt file to the knowledge base
-  {cyan("/ingest text <content>")}  Add raw text to the knowledge base
-  {cyan("/ingest docx <path>")}     Add a Word (.docx) file to the knowledge base
+  {cyan("/ingest txt  <path>")}     Add a plain .txt file
+  {cyan("/ingest text <content>")}  Add raw text
+  {cyan("/ingest docx <path>")}     Add a Word (.docx) file
   {cyan("/sources")}                List all ingested sources
   {cyan("/stats")}                  Show index vector count
   {cyan("/clear")}                  Clear conversation memory
   {cyan("/reset")}                  ⚠  Delete the entire knowledge base
-  {cyan("/model <name>")}           Switch the Ollama model (e.g. mistral)
-  {cyan("/help")}                   Show this help message
+  {cyan("/model <name>")}           Switch the Ollama model (e.g. phi3:mini)
+  {cyan("/help")}                   Show this help
   {cyan("/exit")}  or  {cyan("/quit")}        Exit AgniAI
+
+{bold("Recommended small models for CPU:")}
+  ollama pull phi3:mini      (~2.3 GB)
+  ollama pull llama3.2:3b   (~2.0 GB)
+  ollama pull gemma2:2b     (~1.6 GB)
 """
 
 
@@ -98,20 +112,9 @@ def _ensure_dirs() -> None:
 
 
 def _should_use_rag(query: str) -> bool:
-    """
-    Skip retrieval for tiny greetings and pure small-talk.
-    That keeps CPU prompts short when the user is not asking for facts.
-    """
+    """Skip RAG for short greetings and pure small-talk."""
     q = query.strip().lower()
-    greetings = {
-        "hi",
-        "hello",
-        "hey",
-        "thanks",
-        "thank you",
-        "ok",
-        "okay",
-    }
+    greetings = {"hi", "hello", "hey", "thanks", "thank you", "ok", "okay", "bye"}
     return q not in greetings and len(q.split()) > 2
 
 
@@ -120,12 +123,14 @@ def _should_use_rag(query: str) -> bool:
 def _handle_ingest(command: str) -> None:
     parts = command.split(maxsplit=2)
     if len(parts) < 3:
-        print(yellow("Usage:  /ingest pdf <path>  |  /ingest url <url>  "
-                     "|  /ingest txt <path>  |  /ingest text <content>  "
-                     "|  /ingest docx <path>"))
+        print(yellow(
+            "Usage:  /ingest pdf <path>  |  /ingest url <url>  "
+            "|  /ingest txt <path>  |  /ingest text <content>  "
+            "|  /ingest docx <path>"
+        ))
         return
 
-    kind = parts[1].lower()
+    kind   = parts[1].lower()
     target = parts[2].strip()
 
     try:
@@ -141,7 +146,7 @@ def _handle_ingest(command: str) -> None:
         elif kind == "docx":
             count = ingest_docx(target)
         else:
-            print(yellow(f"  Unknown type '{kind}'. Use: pdf, url, txt, text, or docx."))
+            print(yellow(f"  Unknown type '{kind}'. Use: pdf, url, txt, text, docx."))
             return
 
         if count == 0:
@@ -167,13 +172,17 @@ def _handle_sources() -> None:
 
 def _handle_stats() -> None:
     stats = index_stats()
-    print(f"\n  {bold('Index stats:')}  "
-          f"{cyan(str(stats['vectors']))} vectors  ·  "
-          f"{cyan(str(stats['chunks']))} chunks")
+    print(
+        f"\n  {bold('Index stats:')}  "
+        f"{cyan(str(stats['vectors']))} vectors  ·  "
+        f"{cyan(str(stats['chunks']))} chunks"
+    )
 
 
 def _handle_reset() -> None:
-    confirm = input(yellow("  ⚠  This will DELETE the entire knowledge base. Type YES to confirm: ")).strip()
+    confirm = input(
+        yellow("  ⚠  This will DELETE the entire knowledge base. Type YES to confirm: ")
+    ).strip()
     if confirm == "YES":
         clear_index()
         print(green("  ✔  Knowledge base cleared."))
@@ -184,15 +193,15 @@ def _handle_reset() -> None:
 # ── Formatting ─────────────────────────────────────────────────────────────
 
 def _wrap_answer(text: str, width: int = 80) -> str:
-    """Soft-wrap answer lines for readability in the terminal."""
     lines = text.splitlines()
     wrapped = []
     for line in lines:
         stripped = line.lstrip()
-        indent = len(line) - len(stripped)
-        prefix = " " * indent
-        wrapped_line = textwrap.fill(line, width=width, subsequent_indent=prefix + "  ")
-        wrapped.append(wrapped_line)
+        indent   = len(line) - len(stripped)
+        prefix   = " " * indent
+        wrapped.append(
+            textwrap.fill(line, width=width, subsequent_indent=prefix + "  ")
+        )
     return "\n".join(wrapped)
 
 
@@ -200,18 +209,22 @@ def _wrap_answer(text: str, width: int = 80) -> str:
 
 def run_chat() -> None:
     _ensure_dirs()
-    memory = ConversationMemory()
+    memory       = ConversationMemory()
     active_model: Optional[str] = DEFAULT_MODEL_NAME
-    session = requests.Session()
+    session      = requests.Session()
 
     print(BANNER)
+
     stats = index_stats()
     if stats["vectors"] == 0:
-        print(yellow("  ℹ  Knowledge base is empty.  "
-                     "Use /ingest to add PDFs, URLs, or text.\n"))
+        print(yellow(
+            "  ℹ  Knowledge base is empty.  "
+            "Use /ingest to add PDFs, URLs, or text.\n"
+        ))
     else:
         print(dim(f"  Knowledge base ready: {stats['vectors']} vectors loaded.\n"))
 
+    print(dim(f"  Active model: {active_model}  (type /model <name> to switch)\n"))
     print(dim("  Type /help for commands or just ask a question.\n"))
 
     while True:
@@ -253,14 +266,13 @@ def run_chat() -> None:
             _handle_reset()
             continue
 
-        # Bug #6 fix: match "/model" with or without trailing space
         if low.startswith("/model"):
             parts = raw.split(maxsplit=1)
             if len(parts) == 2 and parts[1].strip():
                 active_model = parts[1].strip()
                 print(green(f"  ✔  Model switched to '{active_model}'."))
             else:
-                print(yellow("  Usage: /model <model-name>  e.g.  /model mistral"))
+                print(yellow("  Usage: /model <model-name>  e.g.  /model phi3:mini"))
             continue
 
         if low.startswith("/ingest "):
@@ -276,38 +288,42 @@ def run_chat() -> None:
         context = ""
         if use_rag:
             print(dim("  🔍 Searching knowledge base…"))
-            docs = search(raw, top_k=min(TOP_K, 2))
+            docs    = search(raw, top_k=min(TOP_K, 2))
             context = build_context(docs)
-            if len(context) > 3000:
-                context = context[:3000].rstrip() + "\n...[truncated]..."
+            # Hard-cap context to keep the prompt tiny (key for CPU speed)
+            if len(context) > MAX_CONTEXT_CHARS:
+                context = context[:MAX_CONTEXT_CHARS].rstrip() + "\n...[truncated]..."
 
         if use_rag and not context:
-            no_info = ("I don't have that information in my knowledge base. "
-                       "Please ingest the relevant document first using "
-                       "/ingest pdf, /ingest url, /ingest docx, or /ingest text.")
+            no_info = (
+                "I don't have that information in my knowledge base. "
+                "Please ingest the relevant document first using "
+                "/ingest pdf, /ingest url, /ingest docx, or /ingest text."
+            )
             print(f"\n{bold(blue('AgniAI'))}: {yellow(no_info)}\n")
-            memory.add("user", raw)
+            memory.add("user",      raw)
             memory.add("assistant", no_info)
             continue
 
         print(dim("  🤖 Generating answer…"))
 
-        history = memory.history()
+        history  = memory.history()
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         if history:
-            messages.extend(history[-4:])
+            messages.extend(history[-4:])   # last 2 exchanges only
 
         if use_rag:
             user_content = (
                 f"Question: {raw}\n\n"
-                f"Retrieved context:\n{context}\n\n"
-                "Answer in a structured, concise format using ONLY the retrieved context above."
+                f"Context:\n{context}\n\n"
+                "Answer concisely using ONLY the context above."
             )
         else:
             user_content = raw
 
         messages.append({"role": "user", "content": user_content})
 
+        # ── LLM call ───────────────────────────────────────────────────────
         try:
             print(f"\n{bold(blue('AgniAI'))}: ", end="", flush=True)
             result = chat_with_fallback(
@@ -317,9 +333,9 @@ def run_chat() -> None:
                 stream_tokens=True,
             )
             answer = result.text
-            print()
+            print()   # newline after streamed tokens
         except PartialResponseError as exc:
-            print(f"\n{red('  ✘  LLM Error:')} {exc}\n")
+            print(f"\n{red('  ✘  Partial response:')} {exc}\n")
             answer = exc.partial_text
         except RuntimeError as exc:
             print(f"\n{red('  ✘  LLM Error:')} {exc}\n")
@@ -327,7 +343,7 @@ def run_chat() -> None:
 
         print(f"{_wrap_answer(answer)}\n")
 
-        memory.add("user", raw)
+        memory.add("user",      raw)
         memory.add("assistant", answer)
 
 
