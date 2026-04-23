@@ -78,7 +78,7 @@ REPEAT_PENALTY = float(os.getenv("OLLAMA_REPEAT_PENALTY","1.1"))
 KEEP_ALIVE     = os.getenv("OLLAMA_KEEP_ALIVE",          "5m")     # ← keep model in RAM forever
 
 # ── RAG limits ───────────────────────────────────────────────────────────────
-MAX_HISTORY_MESSAGES = int(os.getenv("OLLAMA_MAX_HISTORY_MESSAGES", "2"))  # 1 exchange only
+MAX_HISTORY_MESSAGES = int(os.getenv("OLLAMA_MAX_HISTORY_MESSAGES", "5"))  # 4 exchange only
 MAX_RAG_CHARS        = int(os.getenv("OLLAMA_MAX_RAG_CHARS",        "1400"))  # trimmed further
 
 SYSTEM_PROMPT = (
