@@ -4,7 +4,7 @@ ollama_cpu_chat.py
 CPU-optimised Ollama streaming client for AgniAI.
 
 Speed strategy (fastest to slowest impact):
-  1. keep_alive=-1  → model stays in RAM permanently, zero reload cost
+  1. keep_alive= 5m  → model stays in RAM permanently, zero reload cost
   2. num_ctx=512    → half the KV-cache to fill, biggest time-to-first-token win
   3. num_predict=120→ stop generating sooner; RAG answers are short anyway
   4. top_k=10       → less sampling work per token
@@ -65,7 +65,7 @@ MAX_RETRIES         = int(os.getenv("OLLAMA_MAX_RETRIES",          "2"))
 #
 #  TOP_K=10   : Fewer candidates sampled per token → faster sampling loop.
 #
-#  KEEP_ALIVE=-1 : Never unload the model from RAM. The single biggest
+#  KEEP_ALIVE= 5m : Never unload the model from RAM. The single biggest
 #               latency win if you ask multiple questions: zero reload cost.
 #               Uses ~2-4 GB RAM permanently. Change to "10m" if RAM is tight.
 
