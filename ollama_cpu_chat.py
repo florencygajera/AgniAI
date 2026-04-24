@@ -22,7 +22,7 @@ from typing import Callable, Iterable, List, Optional
 
 import requests
 
-from config import MAX_CONTEXT_CHARS as MAX_RAG_CHARS, SYSTEM_PROMPT 
+from config import MAX_CONTEXT_CHARS as MAX_RAG_CHARS, SYSTEM_PROMPT, TOP_K
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -125,7 +125,7 @@ def _truncate(text: str, limit: int) -> str:
 def build_rag_context(query: str) -> str:
     try:
         from rag import build_context, search  # type: ignore
-        docs = search(query, top_k=2)
+        docs = search(query, top_k=TOP_K)
         context = build_context(docs)
         return _truncate(context, MAX_RAG_CHARS)
     except Exception:

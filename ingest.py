@@ -25,6 +25,7 @@ except ModuleNotFoundError:
 from config import (
     CHUNK_OVERLAP,
     CHUNK_WORDS,
+    CHUNK_MIN_WORDS,
     DATA_DIR,
     DOCSTORE_PATH,  # BUG-3 FIX
     EMBEDDING_DIM,
@@ -66,7 +67,13 @@ def chunk_text(
         end = min(start + chunk_words, len(words))
         chunk = " ".join(words[start:end]).strip()
         if chunk:
-            chunks.append(chunk)
+            word_count = len(chunk.split())
+            if word_count < CHUNK_MIN_WORDS and chunks:
+                # Merge tiny trailing fragments into the previous chunk instead
+                # of indexing them as low-signal standalone vectors.
+                chunks[-1] = f"{chunks[-1]} {chunk}".strip()
+            else:
+                chunks.append(chunk)
         if end >= len(words):
             break
         start = max(0, end - overlap)

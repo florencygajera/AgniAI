@@ -61,15 +61,15 @@ CHUNK_OVERLAP = 50      # was 40  — ~25% overlap ratio preserved
 CHUNK_MIN_WORDS = 15    # NEW: discard tiny fragments (e.g. table headers alone)
 
 # ── Retrieval ──────────────────────────────────────────────────────────────
-TOP_K        = 4        # was 2 — retrieve more candidates before re-ranking
+TOP_K        = 5        # was 2 — retrieve more candidates before re-ranking
 RERANK_TOP_K = 3        # NEW: keep best N after cross-encoder re-ranking
-MIN_SCORE    = 0.25     # was 0.01 — drop low-similarity noise
+MIN_SCORE    = 0.18     # was 0.01 — drop low-similarity noise
 
 # Hybrid retrieval weights (dense cosine + BM25 sparse)
 # Final score = DENSE_WEIGHT * cosine_score + BM25_WEIGHT * bm25_score
 # Both normalised to [0, 1] before fusion.
-DENSE_WEIGHT = 0.70     # semantic similarity
-BM25_WEIGHT  = 0.30     # keyword overlap
+DENSE_WEIGHT = 0.55     # semantic similarity
+BM25_WEIGHT  = 0.45     # keyword overlap
 USE_HYBRID   = True     # set False to use dense-only retrieval
 
 # ── Memory ─────────────────────────────────────────────────────────────────
@@ -118,6 +118,7 @@ You are AgniAI, an expert assistant for India's Agniveer / Agnipath recruitment 
 STRICT RULES:
 - Answer ONLY using the numbered reference chunks provided below.
 - Do NOT add any information not present in the reference.
+- Prefer exact facts from the reference over general knowledge.
 - If the reference does not contain the answer, reply exactly:
   "Not found in the provided documents."
 - Cite which chunk(s) you used, e.g. (Source: [1]).
@@ -131,13 +132,14 @@ You are AgniAI, an expert assistant for India's Agniveer / Agnipath recruitment 
 STRICT RULES:
 - Answer ONLY using the numbered reference chunks provided below.
 - Do NOT add any information not present in the reference.
+- Prefer exact facts from the reference over general knowledge.
 - If the reference does not contain the answer, reply exactly:
   "Not found in the provided documents."
-- If you are uncertain about a specific figure, say "approximately" or quote the source directly.
+- If you are uncertain about a specific figure, say "approximately" only when the reference itself is approximate.
 - Cite chunk numbers used, e.g. (Source: [1], [2]).
 
 FORMAT: Well-organised bullet points with sub-bullets where helpful.
-Add 1-2 sentences of context per main point so the reader understands significance.
+Add context only when it is directly supported by the reference.
 """
 
 SYSTEM_PROMPT_DETAIL = """\
@@ -146,6 +148,7 @@ You are AgniAI, an expert assistant for India's Agniveer / Agnipath recruitment 
 STRICT RULES:
 - Answer ONLY using the numbered reference chunks provided below.
 - Do NOT add any information not present in the reference.
+- Prefer exact facts from the reference over general knowledge.
 - If the reference does not contain the answer, reply exactly:
   "Not found in the provided documents."
 - Quote specific figures, dates, and thresholds directly from the reference.

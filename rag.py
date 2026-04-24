@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import pickle
+import re
 import warnings
 from typing import Dict, List, Optional, Sequence
 
@@ -61,6 +62,7 @@ from config import (
 # ── Module-level singletons ────────────────────────────────────────────────
 _MODEL: Optional[SentenceTransformer] = None
 _RERANKER = None          # CrossEncoder, loaded lazily
+_RERANKER_FAILED = False
 _INDEX: Optional[faiss.Index] = None
 _DOCS: List[Dict[str, str]] = []
 _BM25 = None              # rank_bm25.BM25Okapi, loaded lazily
@@ -75,6 +77,33 @@ def _ensure_dirs() -> None:
 
 def _new_index() -> faiss.Index:
     return faiss.IndexFlatIP(EMBEDDING_DIM)
+
+
+def _rebuild_index_from_docs(docs: List[Dict[str, str]]) -> faiss.Index:
+    """
+    Re-embed the current docstore with the active embedding model and build
+    a fresh FAISS index.
+
+    This is used when an existing saved index was created with a different
+    embedding dimension than the one configured now.
+    """
+    index = _new_index()
+    if not docs:
+        return index
+
+    texts = [d.get("text", "") for d in docs]
+    vectors = embed_texts(texts)
+    if vectors.size == 0:
+        return index
+    if vectors.shape[1] != EMBEDDING_DIM:
+        raise ValueError(
+            f"Embedding dimension mismatch while rebuilding index: "
+            f"expected {EMBEDDING_DIM}, got {vectors.shape[1]}"
+        )
+
+    index.add(vectors)
+    save_index(index, docs)
+    return index
 
 
 def _escape_control_chars_in_json_strings(raw: str) -> str:
@@ -149,6 +178,53 @@ def _repair_docstore_from_lines(raw: str) -> List[Dict[str, str]]:
     return docs
 
 
+def _normalize_query_for_retrieval(query: str) -> str:
+    """
+    Strip style words and filler phrases that are useful to the answer tone
+    but harmful for retrieval relevance.
+    """
+    cleaned = query.lower()
+    phrases = (
+        "in short", "briefly", "brief", "quick answer", "short answer",
+        "summarise", "summarize", "tldr", "tl;dr", "in brief",
+        "give me short", "short me", "one line", "one-line",
+        "give a short", "keep it short",
+        "in detail", "detailed", "explain in detail", "full detail",
+        "comprehensive", "thoroughly", "exhaustive", "step by step",
+        "step-by-step", "explain fully", "tell me everything",
+        "give me detail", "elaborate in detail",
+        "elaborate", "explain", "elaborate on", "tell me more",
+        "expand on", "describe", "give more", "more info",
+        "like i'm a beginner", "like i am a beginner", "for a beginner",
+        "as a beginner", "in simple terms", "simple terms", "beginner friendly",
+        "please", "can you", "could you", "tell me", "help me understand",
+    )
+    for phrase in sorted(phrases, key=len, reverse=True):
+        cleaned = re.sub(rf"\b{re.escape(phrase)}\b", " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .,!?:;")
+    words = cleaned.split()
+    if len(words) < 3:
+        cleaned = query.strip().lower()
+
+    # Domain-specific query expansion: the source docs use formal labels that
+    # users often shorten in their question.
+    expansions = (
+        ("age limit", "required age age eligibility"),
+        ("eligibility criteria", "eligible eligibility qualification required age"),
+        ("selection process", "selection process flow chart recruitment process merit medical physical"),
+        ("how is the selection done", "selection process flow chart recruitment process merit medical physical"),
+        ("recruitment process", "flow chart recruitment process registration application merit medical physical"),
+        ("how to apply", "registration application dashboard join indian army"),
+        ("apply", "registration application dashboard join indian army"),
+    )
+    expanded = cleaned
+    for needle, extra in expansions:
+        if needle in expanded:
+            expanded = f"{expanded} {extra}"
+    expanded = re.sub(r"\s+", " ", expanded).strip()
+    return expanded or query.strip()
+
+
 # ── Embedding model ────────────────────────────────────────────────────────
 
 def load_embedding_model() -> SentenceTransformer:
@@ -157,7 +233,7 @@ def load_embedding_model() -> SentenceTransformer:
         return _MODEL
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        _MODEL = SentenceTransformer(EMBEDDING_MODEL)
+        _MODEL = SentenceTransformer(EMBEDDING_MODEL, local_files_only=True)
     return _MODEL
 
 
@@ -183,18 +259,21 @@ def embed_query(query: str) -> np.ndarray:
 
 def load_reranker():
     """Lazy-load the cross-encoder re-ranker."""
-    global _RERANKER
+    global _RERANKER, _RERANKER_FAILED
     if _RERANKER is not None:
         return _RERANKER
+    if _RERANKER_FAILED:
+        return None
     if not USE_RERANKER:
         return None
     try:
         from sentence_transformers import CrossEncoder  # type: ignore
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            _RERANKER = CrossEncoder(RERANKER_MODEL)
+            _RERANKER = CrossEncoder(RERANKER_MODEL, local_files_only=True)
         return _RERANKER
     except Exception as exc:
+        _RERANKER_FAILED = True
         print(f"[WARNING] Could not load re-ranker ({exc}). Using bi-encoder scores only.")
         return None
 
@@ -230,6 +309,20 @@ def _tokenize(text: str) -> List[str]:
     """Simple whitespace + lowercase tokenizer for BM25."""
     import re
     return re.findall(r"[a-zA-Z0-9\u0900-\u097F]+", text.lower())
+
+
+_STOPWORDS = {
+    "a", "an", "and", "are", "be", "by", "for", "from", "how", "i", "in",
+    "is", "it", "me", "my", "of", "on", "or", "please", "show", "tell",
+    "the", "to", "what", "when", "where", "which", "who", "why", "with",
+    "you", "your", "can", "could", "would", "should", "do", "does", "did",
+    "this", "that", "these", "those", "as", "at", "was", "were", "will",
+    "like", "just", "about", "into", "over", "under", "up", "down",
+}
+
+
+def _meaningful_tokens(text: str) -> List[str]:
+    return [t for t in _tokenize(text) if t not in _STOPWORDS and len(t) > 1]
 
 
 def load_bm25():
@@ -339,11 +432,21 @@ def load_index() -> faiss.Index:
     if _INDEX is not None and _DOCS:
         return _INDEX
     _ensure_dirs()
+    _DOCS = load_docstore()
     if FAISS_INDEX_PATH.exists():
         _INDEX = faiss.read_index(str(FAISS_INDEX_PATH))
     else:
         _INDEX = _new_index()
-    _DOCS = load_docstore()
+
+    if _INDEX.d != EMBEDDING_DIM:
+        old_dim = _INDEX.d
+        print(
+            f"[WARNING] Saved FAISS index uses dimension {old_dim}, "
+            f"but the active embedding model uses {EMBEDDING_DIM}. "
+            "Rebuilding the index from the docstore..."
+        )
+        _INDEX = _rebuild_index_from_docs(_DOCS)
+
     if _INDEX.ntotal > 0 and len(_DOCS) == 0:
         print("[WARNING] FAISS index has vectors but docstore is empty. "
               "Run /reset and re-ingest your documents.")
@@ -381,6 +484,16 @@ def _bm25_scores(query: str, n: int) -> np.ndarray:
         return np.zeros(len(_DOCS), dtype="float32")
 
 
+def _min_max_normalize(values: np.ndarray) -> np.ndarray:
+    if values.size == 0:
+        return values
+    lo = float(values.min())
+    hi = float(values.max())
+    if hi - lo < 1e-8:
+        return np.ones_like(values, dtype="float32")
+    return ((values - lo) / (hi - lo)).astype("float32")
+
+
 def search(query: str, top_k: int = TOP_K) -> List[Dict[str, str]]:
     """
     Retrieve top-k most relevant chunks using hybrid dense+sparse search,
@@ -396,23 +509,69 @@ def search(query: str, top_k: int = TOP_K) -> List[Dict[str, str]]:
     if index.ntotal == 0:
         return []
 
-    qvec = embed_query(query)
-    candidate_k = min(top_k * 2, index.ntotal)   # retrieve 2× for re-ranking pool
+    retrieval_query = _normalize_query_for_retrieval(query)
+    qvec = embed_query(retrieval_query)
+    if index.ntotal <= 1000:
+        candidate_k = index.ntotal
+    else:
+        candidate_k = min(max(top_k * 8, 24), index.ntotal)   # broader recall pool
 
     # ── Dense retrieval ────────────────────────────────────────
     scores_dense, ids = index.search(qvec, candidate_k)
     dense_scores = scores_dense[0]
     doc_ids = ids[0]
+    dense_map = {int(doc_id): float(score) for doc_id, score in zip(doc_ids, dense_scores) if doc_id >= 0}
 
     # ── BM25 fusion ────────────────────────────────────────────
     if USE_HYBRID and len(_DOCS) > 0:
-        bm25_all = _bm25_scores(query, len(_DOCS))
-        fused: List[tuple] = []
-        for i, (doc_id, ds) in enumerate(zip(doc_ids, dense_scores)):
-            if doc_id < 0 or doc_id >= len(_DOCS):
+        bm25_all = _bm25_scores(retrieval_query, len(_DOCS))
+        bm25_top_ids = np.argsort(bm25_all)[::-1][:candidate_k]
+
+        query_terms = set(_meaningful_tokens(retrieval_query))
+        token_count = len(retrieval_query.split())
+        if token_count <= 3:
+            dense_weight, bm25_weight = 0.30, 0.70
+        elif token_count <= 6:
+            dense_weight, bm25_weight = 0.40, 0.60
+        else:
+            dense_weight, bm25_weight = DENSE_WEIGHT, BM25_WEIGHT
+
+        candidate_ids: List[int] = []
+        seen_ids: set[int] = set()
+        for doc_id in list(doc_ids) + [int(x) for x in bm25_top_ids]:
+            if doc_id < 0 or doc_id >= len(_DOCS) or doc_id in seen_ids:
                 continue
-            bs = float(bm25_all[doc_id])
-            combined = DENSE_WEIGHT * float(ds) + BM25_WEIGHT * bs
+            candidate_ids.append(int(doc_id))
+            seen_ids.add(int(doc_id))
+
+        dense_values = np.array([dense_map.get(doc_id, 0.0) for doc_id in candidate_ids], dtype="float32")
+        dense_values = _min_max_normalize(dense_values)
+
+        bm25_values = np.array([float(bm25_all[doc_id]) for doc_id in candidate_ids], dtype="float32")
+
+        fused: List[tuple] = []
+        for doc_id, ds, bs in zip(candidate_ids, dense_values, bm25_values):
+            combined = dense_weight * float(ds) + bm25_weight * float(bs)
+            if query_terms:
+                doc_text = _DOCS[doc_id].get("text", "")
+                doc_terms = set(_meaningful_tokens(doc_text))
+                overlap = len(query_terms & doc_terms) / max(1, len(query_terms))
+                combined += 0.20 * overlap
+
+                doc_lower = doc_text.lower()
+                query_lower = retrieval_query.lower()
+                if "age" in query_lower and "required age" in doc_lower:
+                    combined += 0.60
+                if "eligibility" in query_lower and "eligibility criteria" in doc_lower:
+                    combined += 0.60
+                if "eligibility" in query_lower and "required age" in doc_lower:
+                    combined += 0.30
+                if ("selection" in query_lower or "process" in query_lower or "recruitment" in query_lower) and (
+                    "flow chart" in doc_lower and "recruitment" in doc_lower
+                ):
+                    combined += 0.80
+                if "selection" in query_lower and "merit" in doc_lower:
+                    combined += 0.20
             if combined < MIN_SCORE:
                 continue
             fused.append((combined, int(doc_id)))
@@ -434,11 +593,21 @@ def search(query: str, top_k: int = TOP_K) -> List[Dict[str, str]]:
             candidates.append(doc)
 
     if not candidates:
+        # Keep the strongest dense hit as a fallback rather than returning
+        # empty context when the query is still likely relevant.
+        if len(doc_ids) > 0 and 0 <= int(doc_ids[0]) < len(_DOCS):
+            doc = dict(_DOCS[int(doc_ids[0])])
+            doc["score"] = round(float(dense_scores[0]), 4)
+            return [doc]
         return []
 
     # ── Cross-encoder re-ranking ───────────────────────────────
     if USE_RERANKER:
-        candidates = rerank(query, candidates, top_n=min(RERANK_TOP_K, len(candidates)))
+        candidates = rerank(
+            query,
+            candidates,
+            top_n=min(max(top_k, RERANK_TOP_K), len(candidates)),
+        )
 
     # ── MMR diversity ──────────────────────────────────────────
     if len(candidates) > 1:
