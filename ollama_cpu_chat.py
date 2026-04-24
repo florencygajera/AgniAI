@@ -71,10 +71,10 @@ MAX_RETRIES         = int(os.getenv("OLLAMA_MAX_RETRIES",          "2"))
 #               latency win if you ask multiple questions: zero reload cost.
 #               Uses ~2-4 GB RAM permanently. Change to "10m" if RAM is tight.
 
-MAX_TOKENS     = int(os.getenv("OLLAMA_MAX_TOKENS",      "512")) 
-NUM_CTX        = int(os.getenv("OLLAMA_NUM_CTX",         "2048"))  
+MAX_TOKENS     = int(os.getenv("OLLAMA_MAX_TOKENS",      "256")) 
+NUM_CTX        = int(os.getenv("OLLAMA_NUM_CTX",         "512"))  
 TEMPERATURE    = float(os.getenv("OLLAMA_TEMPERATURE",   "0.1"))   
-TOP_K          = int(os.getenv("OLLAMA_TOP_K",           "10"))    
+TOP_K          = int(os.getenv("OLLAMA_TOP_K",           "5"))    
 TOP_P          = float(os.getenv("OLLAMA_TOP_P",         "0.9"))
 REPEAT_PENALTY = float(os.getenv("OLLAMA_REPEAT_PENALTY","1.1"))
 KEEP_ALIVE     = os.getenv("OLLAMA_KEEP_ALIVE",          "5m")     

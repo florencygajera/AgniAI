@@ -38,7 +38,7 @@ CHUNK_WORDS   = 200
 CHUNK_OVERLAP = 40
 
 # ── Retrieval ──────────────────────────────────────────────────────────────
-TOP_K     = 4
+TOP_K     = 2
 MIN_SCORE = 0.01
 
 # ── Memory ─────────────────────────────────────────────────────────────────
@@ -48,7 +48,7 @@ MEMORY_MAX_MESSAGES = 6
 REQUEST_TIMEOUT = 90
 
 # ── Context budget ─────────────────────────────────────────────────────────
-MAX_CONTEXT_CHARS = 2400
+MAX_CONTEXT_CHARS = 1500
 
 # ── CORS ───────────────────────────────────────────────────────────────────
 # Origins allowed to call this API.
