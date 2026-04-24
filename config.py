@@ -50,6 +50,17 @@ REQUEST_TIMEOUT = 90
 # ── Context budget ─────────────────────────────────────────────────────────
 MAX_CONTEXT_CHARS = 2400
 
+# ── CORS ───────────────────────────────────────────────────────────────────
+# Origins allowed to call this API.
+# During development: "*" allows everything (React dev server, .NET, Postman).
+# Before production: replace with exact URLs, e.g.:
+#   ALLOWED_ORIGINS = [
+#       "http://localhost:3000",        # React dev
+#       "http://localhost:5173",        # Vite dev
+#       "https://yourapp.azurewebsites.net",  # deployed .NET
+#   ]
+ALLOWED_ORIGINS = "*"
+
 # ── Answer-style keywords ──────────────────────────────────────────────────
 # These are checked against the user's question (lowercase) in main.py.
 # First match wins; if none match, ELABORATE is used as the default.

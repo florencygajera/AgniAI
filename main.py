@@ -2,6 +2,7 @@
 main.py
 =======
 AgniAI — Offline CLI chatbot for Agniveer recruitment queries.
+Used ONLY for local testing. The .NET team integrates via app.py (REST API).
 
 Run:
     python main.py
@@ -145,22 +146,18 @@ def detect_answer_style(query: str) -> Tuple[str, str]:
     """
     q = query.lower()
 
-    # Short takes highest priority — it's the most restrictive
     for kw in STYLE_SHORT_KEYWORDS:
         if kw in q:
             return "short", SYSTEM_PROMPT_SHORT
 
-    # Detail next — comprehensive answers
     for kw in STYLE_DETAIL_KEYWORDS:
         if kw in q:
             return "detail", SYSTEM_PROMPT_DETAIL
 
-    # Elaborate — structured but not exhaustive
     for kw in STYLE_ELABORATE_KEYWORDS:
         if kw in q:
             return "elaborate", SYSTEM_PROMPT_ELABORATE
 
-    # Default when no keyword matches
     return "elaborate", SYSTEM_PROMPT_ELABORATE
 
 
@@ -282,7 +279,6 @@ def run_chat() -> None:
     ))
 
     while True:
-        # ── Input ──────────────────────────────────────────────────────────
         try:
             raw = input("You: ").strip()
         except (EOFError, KeyboardInterrupt):
@@ -294,7 +290,6 @@ def run_chat() -> None:
 
         low = raw.lower()
 
-        # ── Built-in commands ──────────────────────────────────────────────
         if low in {"/exit", "/quit"}:
             print("Goodbye.")
             break
@@ -369,7 +364,6 @@ def run_chat() -> None:
         history = memory.history()
 
         if use_rag:
-            # RAG path: inject style-aware system prompt + context
             messages = [{"role": "system", "content": active_system_prompt}]
             if history:
                 messages.extend(history[-4:])
@@ -378,7 +372,6 @@ def run_chat() -> None:
                 f"Question: {raw}"
             )
         else:
-            # Greeting / small-talk path: no RAG, plain prompt
             messages = [{"role": "system", "content": (
                 "You are AgniAI, a helpful assistant for India's Agniveer "
                 "recruitment scheme. Respond naturally and concisely."
