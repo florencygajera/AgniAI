@@ -74,6 +74,13 @@ def red(t: str) -> str:    return _c("91", t)
 def blue(t: str) -> str:   return _c("94", t)
 
 
+BANNER = cyan(r"""
+   ___                  _ ___    ___
+  / _ |___  ___ _  ___ (_) _ \  / _ \
+ / __ / _ \/ _ \ |/ _ \| | | | | (_) |
+/_/ |_\___/_//_/___|___/|_|___/  \___/
+""") + bold("  Agniveer AI Assistant  — Offline · Local · Private\n")
+
 HELP_TEXT = f"""
 Available commands:
 
@@ -95,6 +102,7 @@ Recommended small models for CPU:
   ollama pull llama3.2:3b   (~2.0 GB)
   ollama pull gemma2:2b     (~1.6 GB)
 """
+
 
 # ── Directory bootstrap ────────────────────────────────────────────────────
 
