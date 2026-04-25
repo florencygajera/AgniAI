@@ -81,10 +81,10 @@ MAX_CONTEXT_CHARS_DEFAULT = int(os.getenv("MAX_CONTEXT_CHARS_DEFAULT", "3000"))
 # Token budgets
 MAX_TOKENS_STYLE = {
     "short": int(os.getenv("MAX_TOKENS_SHORT", "300")),
-    "elaborate": int(os.getenv("MAX_TOKENS_ELABORATE", "400")),
-    "detail": int(os.getenv("MAX_TOKENS_DETAIL", "500")),
+    "elaborate": int(os.getenv("MAX_TOKENS_ELABORATE", "500")),
+    "detail": int(os.getenv("MAX_TOKENS_DETAIL", "800")),
 }
-MAX_TOKENS_DEFAULT = int(os.getenv("MAX_TOKENS_DEFAULT", "400"))
+MAX_TOKENS_DEFAULT = int(os.getenv("MAX_TOKENS_DEFAULT", "500"))
 
 # CORS
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*")
