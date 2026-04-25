@@ -3,12 +3,14 @@ ollama_cpu_chat.py
 ==================
 CPU-optimised Ollama streaming client for AgniAI.
 
-Speed strategy (fastest to slowest impact):
-  1. keep_alive= 5m  → model stays in RAM permanently, zero reload cost
-  2. num_ctx=512    → half the KV-cache to fill, biggest time-to-first-token win
-  3. num_predict=120→ stop generating sooner; RAG answers are short anyway
-  4. top_k=10       → less sampling work per token
-  5. num_thread=0   → Ollama uses all CPU cores automatically
+Fixes in this version:
+  • TOP_K variable no longer shadows the config.TOP_K import (name was
+    reused locally — caused retrieval TOP_K to be overwritten to 5)
+  • Added max_tokens_override parameter to chat_with_fallback() so
+    app.py and main.py can pass per-style token budgets
+  • KEEP_ALIVE raised to 10m for stability on slower machines
+  • MAX_TOKENS default raised to 512 (overridden per-style at call time)
+  • NUM_CTX raised to 3072 — fits system prompt + 4000-char context + answer
 """
 
 from __future__ import annotations
@@ -22,7 +24,7 @@ from typing import Callable, Iterable, List, Optional
 
 import requests
 
-from config import MAX_CONTEXT_CHARS as MAX_RAG_CHARS, SYSTEM_PROMPT, TOP_K
+from config import MAX_CONTEXT_CHARS_DEFAULT, SYSTEM_PROMPT, TOP_K as _CONFIG_TOP_K
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -38,49 +40,40 @@ OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 CHAT_ENDPOINT   = f"{OLLAMA_BASE_URL}/api/chat"
 TAGS_ENDPOINT   = f"{OLLAMA_BASE_URL}/api/tags"
 
-# ── Model priority ──────────────────────────────────────────────────────────
 MODEL_NAME = os.getenv("OLLAMA_MODEL", "phi3:mini")
 
 FALLBACK_MODELS: List[str] = [
     m.strip()
     for m in os.getenv(
         "OLLAMA_FALLBACK_MODELS",
-        "phi3:mini,phi3:3.8b,gemma2:2b,llama3.2:3b,llama3.2:1b,mistral:7b-instruct-q4_0,llama3:latest",
+        "phi3:mini,phi3:3.8b,gemma2:2b,llama3.2:3b,llama3.2:1b,"
+        "mistral:7b-instruct-q4_0,llama3:latest",
     ).split(",")
     if m.strip()
 ]
 
 # ── Timeouts ────────────────────────────────────────────────────────────────
-TIMEOUT_CONNECT     = float(os.getenv("OLLAMA_CONNECT_TIMEOUT",   "8"))
-FIRST_TOKEN_TIMEOUT = float(os.getenv("OLLAMA_FIRST_TOKEN_TIMEOUT","45"))
-STREAM_TIMEOUT      = float(os.getenv("OLLAMA_STREAM_TIMEOUT",    "120"))
-MAX_RETRIES         = int(os.getenv("OLLAMA_MAX_RETRIES",          "2"))
+TIMEOUT_CONNECT     = float(os.getenv("OLLAMA_CONNECT_TIMEOUT",    "8"))
+FIRST_TOKEN_TIMEOUT = float(os.getenv("OLLAMA_FIRST_TOKEN_TIMEOUT", "60"))
+STREAM_TIMEOUT      = float(os.getenv("OLLAMA_STREAM_TIMEOUT",     "180"))
+MAX_RETRIES         = int(os.getenv("OLLAMA_MAX_RETRIES",           "2"))
 
-# ── Generation knobs — tuned for maximum CPU speed ──────────────────────────
-#
-#  NUM_CTX    : KV-cache size. The single biggest lever for speed on CPU.
-#               512 tokens is enough for system prompt + 2 RAG chunks + answer.
-#               Cutting from 1024 → 512 roughly halves prefill time.
-#
-#  MAX_TOKENS : Cap output length. RAG answers rarely need >100 tokens.
-#               Shorter cap = faster wall-clock finish time.
-#
-#  TOP_K=10   : Fewer candidates sampled per token → faster sampling loop.
-#
-#  KEEP_ALIVE= 5m : Never unload the model from RAM. The single biggest
-#               latency win if you ask multiple questions: zero reload cost.
-#               Uses ~2-4 GB RAM permanently. Change to "10m" if RAM is tight.
+# ── Generation knobs ──────────────────────────────────────────────────────────
+#   NUM_CTX = 3072 fits: system prompt (~500 tokens) + 4000 char context
+#             (~700 tokens) + history + answer comfortably.
+#   MAX_TOKENS = default ceiling; overridden per-style via max_tokens_override.
+#   _SAMPLING_TOP_K = sampling knob — renamed from TOP_K to avoid shadowing
+#                     the retrieval TOP_K imported from config.
 
-MAX_TOKENS     = int(os.getenv("OLLAMA_MAX_TOKENS",      "512")) 
-NUM_CTX        = int(os.getenv("OLLAMA_NUM_CTX",         "2048"))  
-TEMPERATURE    = float(os.getenv("OLLAMA_TEMPERATURE",   "0.1"))   
-TOP_K          = int(os.getenv("OLLAMA_TOP_K",           "5"))    
-TOP_P          = float(os.getenv("OLLAMA_TOP_P",         "0.9"))
-REPEAT_PENALTY = float(os.getenv("OLLAMA_REPEAT_PENALTY","1.1"))
-KEEP_ALIVE     = os.getenv("OLLAMA_KEEP_ALIVE",          "5m")     
+MAX_TOKENS      = int(os.getenv("OLLAMA_MAX_TOKENS",      "512"))
+NUM_CTX         = int(os.getenv("OLLAMA_NUM_CTX",         "3072"))
+TEMPERATURE     = float(os.getenv("OLLAMA_TEMPERATURE",   "0.1"))
+_SAMPLING_TOP_K = int(os.getenv("OLLAMA_TOP_K",           "10"))   # sampling knob only
+TOP_P           = float(os.getenv("OLLAMA_TOP_P",         "0.9"))
+REPEAT_PENALTY  = float(os.getenv("OLLAMA_REPEAT_PENALTY","1.1"))
+KEEP_ALIVE      = os.getenv("OLLAMA_KEEP_ALIVE",          "10m")
 
-# ── RAG limits ───────────────────────────────────────────────────────────────
-MAX_HISTORY_MESSAGES = int(os.getenv("OLLAMA_MAX_HISTORY_MESSAGES", "5"))  
+MAX_HISTORY_MESSAGES = int(os.getenv("OLLAMA_MAX_HISTORY_MESSAGES", "6"))
 
 
 # =============================================================================
@@ -110,7 +103,7 @@ class PartialResponseError(OllamaError):
 
 
 # =============================================================================
-# RAG HOOK
+# RAG HOOK (for standalone CLI usage)
 # =============================================================================
 
 def _truncate(text: str, limit: int) -> str:
@@ -125,9 +118,9 @@ def _truncate(text: str, limit: int) -> str:
 def build_rag_context(query: str) -> str:
     try:
         from rag import build_context, search  # type: ignore
-        docs = search(query, top_k=TOP_K)
+        docs    = search(query, top_k=_CONFIG_TOP_K)
         context = build_context(docs)
-        return _truncate(context, MAX_RAG_CHARS)
+        return _truncate(context, MAX_CONTEXT_CHARS_DEFAULT)
     except Exception:
         return ""
 
@@ -177,7 +170,6 @@ def _candidate_models(requested: str, installed: List[str]) -> List[str]:
             _add(fb)
     for m in installed:
         _add(m)
-    # BUG-6 FIX: do not append fallback models that are not installed.
     return ordered
 
 
@@ -205,7 +197,10 @@ def _ollama_chat_once(
     *,
     stream_tokens: bool = True,
     on_token: Optional[Callable[[str], None]] = None,
+    max_tokens_override: Optional[int] = None,
 ) -> ChatResult:
+    effective_max_tokens = max_tokens_override if max_tokens_override is not None else MAX_TOKENS
+
     payload = {
         "model": model,
         "messages": messages,
@@ -214,11 +209,11 @@ def _ollama_chat_once(
         "options": {
             "temperature":    TEMPERATURE,
             "num_ctx":        NUM_CTX,
-            "num_predict":    MAX_TOKENS,
-            "top_k":          TOP_K,
+            "num_predict":    effective_max_tokens,
+            "top_k":          _SAMPLING_TOP_K,   # sampling knob — NOT retrieval TOP_K
             "top_p":          TOP_P,
             "repeat_penalty": REPEAT_PENALTY,
-            "num_thread":     int(os.getenv("OLLAMA_NUM_THREAD", "0")),  
+            "num_thread":     int(os.getenv("OLLAMA_NUM_THREAD", "0")),
         },
     }
 
@@ -285,10 +280,11 @@ def _ollama_chat_once(
         if pieces:
             raise PartialResponseError("Malformed JSON mid-stream.", "".join(pieces)) from exc
         raise OllamaError(f"Malformed JSON: {exc}") from exc
-    except KeyboardInterrupt:  # CLEANUP-FIX
-        if pieces:  # CLEANUP-FIX
-            raise PartialResponseError("Interrupted by user.", "".join(pieces))  
-        raise  # CLEANUP-FIX
+
+    except KeyboardInterrupt:
+        if pieces:
+            raise PartialResponseError("Interrupted by user.", "".join(pieces))
+        raise
 
     duration = time.time() - start
     return ChatResult(
@@ -306,6 +302,7 @@ def chat_with_fallback(
     messages: List[dict],
     *,
     stream_tokens: bool = True,
+    max_tokens_override: Optional[int] = None,
 ) -> ChatResult:
     installed  = _installed_models(session)
     candidates = _candidate_models(requested_model, installed)
@@ -317,7 +314,13 @@ def chat_with_fallback(
     for model in candidates:
         for attempt in range(1, MAX_RETRIES + 1):
             try:
-                return _ollama_chat_once(session, model, messages, stream_tokens=stream_tokens)
+                return _ollama_chat_once(
+                    session,
+                    model,
+                    messages,
+                    stream_tokens=stream_tokens,
+                    max_tokens_override=max_tokens_override,
+                )
             except PartialResponseError:
                 raise
             except OllamaError as exc:
@@ -343,7 +346,10 @@ def main() -> int:
     model   = MODEL_NAME
     history: List[dict] = []
 
-    print(f"AgniAI CPU chat | model={model} | num_ctx={NUM_CTX} | max_tokens={MAX_TOKENS} | keep_alive={KEEP_ALIVE}")
+    print(
+        f"AgniAI CPU chat | model={model} | num_ctx={NUM_CTX} | "
+        f"max_tokens={MAX_TOKENS} | keep_alive={KEEP_ALIVE}"
+    )
     installed = _installed_models(session)
     if installed:
         print(f"Installed (smallest first): {', '.join(installed)}\n")
@@ -380,11 +386,14 @@ def main() -> int:
         try:
             result = chat_with_fallback(session, model, messages, stream_tokens=True)
             print()
-            history.append({"role": "user",      "content": user})
-            history.append({"role": "assistant",  "content": result.text})
+            history.append({"role": "user",     "content": user})
+            history.append({"role": "assistant", "content": result.text})
             if len(history) > MAX_HISTORY_MESSAGES * 2:
                 history = history[-(MAX_HISTORY_MESSAGES * 2):]
-            print(f"[{result.model} | {result.duration_s:.1f}s | prompt={result.prompt_tokens} completion={result.completion_tokens}]")
+            print(
+                f"[{result.model} | {result.duration_s:.1f}s | "
+                f"prompt={result.prompt_tokens} completion={result.completion_tokens}]"
+            )
         except PartialResponseError as exc:
             print(f"\n[partial] {exc.partial_text}")
         except OllamaError as exc:

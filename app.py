@@ -3,31 +3,26 @@ app.py
 ======
 Flask REST API for AgniAI — the integration point for the .NET ChatController.
 
-The .NET backend calls these endpoints:
-    POST  /api/chat          — main chat (send message, get answer)
-    POST  /api/ingest        — add a document to the knowledge base
-    GET   /api/sources       — list all ingested sources
-    GET   /api/stats         — index vector count
-    GET   /api/health        — health check (used by .NET before routing requests)
-    POST  /api/clear_memory  — wipe conversation history
-    POST  /api/reset_index   — ⚠ delete entire knowledge base
+Fixes in this version:
+  • detect_answer_style imported from main.py — decoupled into its own
+    helper here so app.py has no dependency on main.py's CLI code
+  • Per-style MAX_CONTEXT_CHARS and MAX_TOKENS passed through to LLM
+  • history[-6:] instead of history[-4:] — more coherent multi-turn context
+  • images field always returned in /api/chat response (frontend ready)
+  • /api/health returns 503 with explanation when Ollama is unreachable
+  • CORS locked to ALLOWED_ORIGINS from config
 
-Start the service:
-    python app.py
-
-.NET ChatController.cs calls:
+The .NET backend calls:
     POST http://localhost:5000/api/chat
-    Body: { "message": "What is the age limit?", "model": "phi3:mini" (optional) }
+    Body: { "message": "What is the age limit?", "model": "phi3:mini" (opt) }
 
     Response:
     {
         "success": true,
-        "answer": "...",
-        "style": "short|elaborate|detail"
+        "answer":  "...",
+        "style":   "short|elaborate|detail",
+        "images":  []
     }
-
-CORS is enabled for all origins during development.
-Lock it down via ALLOWED_ORIGINS in config.py before production.
 """
 
 from __future__ import annotations
@@ -51,9 +46,15 @@ from api_models import (
 from config import (
     ALLOWED_ORIGINS,
     MAX_CONTEXT_CHARS,
+    MAX_CONTEXT_CHARS_DEFAULT,
+    MAX_TOKENS_STYLE,
+    MAX_TOKENS_DEFAULT,
     SYSTEM_PROMPT_DETAIL,
     SYSTEM_PROMPT_ELABORATE,
     SYSTEM_PROMPT_SHORT,
+    STYLE_DETAIL_KEYWORDS,
+    STYLE_ELABORATE_KEYWORDS,
+    STYLE_SHORT_KEYWORDS,
     TOP_K,
 )
 from ingest import (
@@ -65,45 +66,101 @@ from ingest import (
     ingest_url,
     list_sources,
 )
-from main import detect_answer_style, _should_use_rag
 from memory import ConversationMemory
 from ollama_cpu_chat import MODEL_NAME as DEFAULT_MODEL
 from ollama_cpu_chat import PartialResponseError, chat_with_fallback
 from rag import build_context, index_stats, search
 
+import re
+
 # ── Flask app ──────────────────────────────────────────────────────────────
 app = Flask(__name__)
 app.config["JSON_AS_ASCII"] = False
-
-# CORS — allows the React frontend (any origin during dev) and the
-# .NET backend to call this service without browser/server header errors.
-# Lock ALLOWED_ORIGINS down to specific URLs before going to production.
 CORS(app, origins=ALLOWED_ORIGINS)
 
-# ── Shared state (one session per server process) ─────────────────────────
+# ── Shared state ───────────────────────────────────────────────────────────
 _memory       = ConversationMemory()
 _session      = _requests.Session()
 _active_model = DEFAULT_MODEL
 _lock         = threading.Lock()
 
 
+# ── Style detection (self-contained, no dependency on main.py) ─────────────
+
+def _kw_match(query_lower: str, keywords: list) -> bool:
+    for kw in keywords:
+        if " " in kw:
+            if kw in query_lower:
+                return True
+        else:
+            if re.search(rf"\b{re.escape(kw)}\b", query_lower):
+                return True
+    return False
+
+
+def detect_answer_style(query: str):
+    """Returns (style_name, system_prompt)."""
+    q = query.lower()
+    if _kw_match(q, STYLE_SHORT_KEYWORDS):
+        return "short", SYSTEM_PROMPT_SHORT
+    if _kw_match(q, STYLE_DETAIL_KEYWORDS):
+        return "detail", SYSTEM_PROMPT_DETAIL
+    if _kw_match(q, STYLE_ELABORATE_KEYWORDS):
+        return "elaborate", SYSTEM_PROMPT_ELABORATE
+    return "elaborate", SYSTEM_PROMPT_ELABORATE
+
+
+def _should_use_rag(query: str) -> bool:
+    q = query.strip().lower()
+    _GREETINGS = {
+        "hi", "hello", "hey", "thanks", "thank you", "ok", "okay", "bye",
+        "good morning", "good evening", "good afternoon", "greetings",
+        "welcome", "sup", "yo",
+    }
+    words = q.split()
+    if len(words) <= 3 and q in _GREETINGS:
+        return False
+    return True
+
+
+def _get_context_limit(style: str) -> int:
+    if isinstance(MAX_CONTEXT_CHARS, dict):
+        return MAX_CONTEXT_CHARS.get(style, MAX_CONTEXT_CHARS_DEFAULT)
+    return int(MAX_CONTEXT_CHARS)
+
+
+def _get_token_limit(style: str) -> int:
+    return MAX_TOKENS_STYLE.get(style, MAX_TOKENS_DEFAULT)
+
+
 # =============================================================================
-# HEALTH  — .NET calls this to verify the Python service is up
+# HEALTH
 # =============================================================================
 
 @app.route("/api/health")
 def health():
     """
     GET /api/health
-
-    .NET ChatController should call this before routing chat requests.
-    Returns 200 when the service and knowledge base are ready.
-
-    C# usage:
-        var resp = await _http.GetAsync("http://localhost:5000/api/health");
-        resp.EnsureSuccessStatusCode();
+    Returns 200 when both the service and Ollama are reachable.
+    Returns 503 when Ollama is down (so .NET can surface a useful error).
     """
     stats_data = index_stats()
+    # Quick Ollama reachability check
+    ollama_ok = True
+    try:
+        _session.get("http://localhost:11434/api/tags", timeout=3)
+    except Exception:
+        ollama_ok = False
+
+    if not ollama_ok:
+        body = ok_health(
+            vectors=stats_data["vectors"],
+            chunks=stats_data["chunks"],
+            model=_active_model,
+            status="ollama_unreachable",
+        )
+        return jsonify(body), 503
+
     return jsonify(ok_health(
         vectors=stats_data["vectors"],
         chunks=stats_data["chunks"],
@@ -113,7 +170,7 @@ def health():
 
 
 # =============================================================================
-# CHAT  — main endpoint the .NET ChatController posts to
+# CHAT
 # =============================================================================
 
 @app.route("/api/chat", methods=["POST"])
@@ -123,20 +180,15 @@ def chat():
     Body JSON:
         {
             "message": "What is the age limit?",   ← required
-            "model":   "phi3:mini"                 ← optional, overrides default
+            "model":   "phi3:mini"                 ← optional
         }
 
     Response JSON:
         {
             "success": true,
             "answer":  "...",
-            "style":   "short|elaborate|detail"
-        }
-
-    On error:
-        {
-            "success": false,
-            "error": "reason"
+            "style":   "short|elaborate|detail",
+            "images":  []
         }
     """
     global _active_model
@@ -153,8 +205,10 @@ def chat():
             _active_model = model
         current_model = _active_model
 
-    # ── Detect answer style from question wording ──────────────────────────
+    # ── Detect style ───────────────────────────────────────────────────────
     style_name, system_prompt = detect_answer_style(message)
+    context_limit = _get_context_limit(style_name)
+    token_limit   = _get_token_limit(style_name)
 
     # ── RAG retrieval ──────────────────────────────────────────────────────
     use_rag = _should_use_rag(message)
@@ -162,8 +216,8 @@ def chat():
     if use_rag:
         docs    = search(message, top_k=TOP_K)
         context = build_context(docs)
-        if len(context) > MAX_CONTEXT_CHARS:
-            context = context[:MAX_CONTEXT_CHARS].rstrip() + "\n...[truncated]..."
+        if len(context) > context_limit:
+            context = context[:context_limit].rstrip() + "\n...[truncated]..."
 
     # Knowledge base has no relevant info
     if use_rag and not context:
@@ -175,13 +229,13 @@ def chat():
         _memory.add("assistant", answer)
         return jsonify(ok_chat(answer=answer, style=style_name))
 
-    # ── Build message list for the LLM ────────────────────────────────────
+    # ── Build message list ─────────────────────────────────────────────────
     history = _memory.history()
 
     if use_rag:
         messages = [{"role": "system", "content": system_prompt}]
         if history:
-            messages.extend(history[-4:])
+            messages.extend(history[-6:])   # FIX: was -4
         user_content = f"Reference information:\n{context}\n\nQuestion: {message}"
     else:
         messages = [{"role": "system", "content": (
@@ -189,27 +243,26 @@ def chat():
             "recruitment scheme. Respond naturally and concisely."
         )}]
         if history:
-            messages.extend(history[-4:])
+            messages.extend(history[-6:])
         user_content = message
 
     messages.append({"role": "user", "content": user_content})
 
-    # ── LLM call ───────────────────────────────────────────────────────────
+    # ── LLM call with per-style token limit ────────────────────────────────
     try:
         result = chat_with_fallback(
             _session,
             current_model,
             messages,
-            stream_tokens=False,   # REST API — no streaming, return full answer
+            stream_tokens=False,
+            max_tokens_override=token_limit,
         )
         answer = result.text
 
     except PartialResponseError as exc:
-        # Ollama returned something before cutting out — use what we got
         answer = exc.partial_text or "Partial response received. Please try again."
 
     except RuntimeError as exc:
-        # Ollama is down or no model loaded
         return jsonify(*err(f"LLM service unavailable: {exc}", 503))
 
     _memory.add("user",      message)
@@ -219,7 +272,7 @@ def chat():
 
 
 # =============================================================================
-# INGEST  — add documents to the knowledge base
+# INGEST
 # =============================================================================
 
 @app.route("/api/ingest", methods=["POST"])
@@ -228,16 +281,8 @@ def ingest():
     POST /api/ingest
     Body JSON:
         {
-            "kind":   "pdf|url|txt|text|docx",   ← required
-            "target": "/path/to/file or URL"     ← required
-        }
-
-    Response JSON:
-        {
-            "success": true,
-            "message": "Ingested 12 chunks.",
-            "chunks":  12,
-            "source":  "/path/to/file"
+            "kind":   "pdf|url|txt|text|docx",
+            "target": "/path/to/file or URL"
         }
     """
     data   = request.get_json(force=True, silent=True) or {}
@@ -284,50 +329,25 @@ def ingest():
 
 
 # =============================================================================
-# SOURCES  — list everything in the knowledge base
+# SOURCES / STATS / MEMORY / RESET
 # =============================================================================
 
 @app.route("/api/sources")
 def sources():
-    """
-    GET /api/sources
-
-    Response JSON:
-        {
-            "success": true,
-            "count": 3,
-            "sources": [
-                { "source": "...", "doc_type": "pdf", "chunk_count": 12 },
-                ...
-            ]
-        }
-    """
+    """GET /api/sources — list all ingested sources."""
     return jsonify(ok_sources(list_sources()))
 
 
-# =============================================================================
-# STATS  — index size
-# =============================================================================
-
 @app.route("/api/stats")
 def stats():
-    """
-    GET /api/stats
-
-    Response JSON:
-        { "success": true, "vectors": 115, "chunks": 115 }
-    """
+    """GET /api/stats — index vector count."""
     s = index_stats()
     return jsonify(ok_stats(vectors=s["vectors"], chunks=s["chunks"]))
 
 
-# =============================================================================
-# MEMORY & RESET
-# =============================================================================
-
 @app.route("/api/clear_memory", methods=["POST"])
 def clear_memory():
-    """POST /api/clear_memory — wipe conversation history for this session."""
+    """POST /api/clear_memory — wipe conversation history."""
     _memory.clear()
     return jsonify(ok_message("Conversation memory cleared."))
 

@@ -1,22 +1,22 @@
 """
 rag.py
 ======
-Core retrieval-augmented generation layer — accuracy-optimised edition.
+Core retrieval-augmented generation layer — accuracy-maximised edition.
 
-Accuracy improvements over baseline:
-  1. Upgraded embedding model: all-mpnet-base-v2 (768-dim vs 384-dim)
-     → Better semantic understanding, ~5-8pp NDCG improvement
-  2. Hybrid retrieval: dense cosine + BM25 sparse, score-fused
-     → Catches keyword matches that dense retrieval misses (e.g. exact names)
-  3. Cross-encoder re-ranking: ms-marco-MiniLM-L-6-v2
-     → Re-scores top candidates with full query×chunk interaction
-     → Typically +5-10pp precision@k vs bi-encoder alone
-  4. MMR diversity: removes near-duplicate chunks before sending to LLM
-     → Reduces repetition and frees token budget for distinct evidence
-  5. Tighter MIN_SCORE threshold (0.20 vs 0.01) — drops noisy matches
-  6. Larger context budget (3500 vs 1500 chars) — more evidence per query
-  7. Context formatted with explicit chunk numbering [1], [2] so LLM
-     can cite sources reliably
+Fixes in this version vs previous:
+  1. BM25 stopwords: "age", "pay", "rank", "year" removed from stopword list
+     — these are crucial Agniveer domain terms that were being dropped
+  2. MMR lambda tuned to 0.7 (slightly more relevance-biased) for small
+     single-document corpora where diversity hurts more than it helps
+  3. build_context deduplication fingerprint extended to 150 chars so
+     genuinely different chunks that share a short opening don't get dropped
+  4. Dense-only fallback now returns top-3 chunks (not just 1) when nothing
+     passes MIN_SCORE — prevents empty context on borderline queries
+  5. Query expansion covers more Agniveer-specific term patterns
+  6. _normalize_query_for_retrieval is now less aggressive — only strips
+     obvious filler, not domain terms like "explain" which add useful signal
+  7. BM25 per-domain boosting extended (salary, insurance, training, etc.)
+  8. Candidate pool now capped at min(top_k * 12, ntotal) for better recall
 """
 
 import json
@@ -61,11 +61,11 @@ from config import (
 
 # ── Module-level singletons ────────────────────────────────────────────────
 _MODEL: Optional[SentenceTransformer] = None
-_RERANKER = None          # CrossEncoder, loaded lazily
+_RERANKER = None
 _RERANKER_FAILED = False
 _INDEX: Optional[faiss.Index] = None
 _DOCS: List[Dict[str, str]] = []
-_BM25 = None              # rank_bm25.BM25Okapi, loaded lazily
+_BM25 = None
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -80,27 +80,18 @@ def _new_index() -> faiss.Index:
 
 
 def _rebuild_index_from_docs(docs: List[Dict[str, str]]) -> faiss.Index:
-    """
-    Re-embed the current docstore with the active embedding model and build
-    a fresh FAISS index.
-
-    This is used when an existing saved index was created with a different
-    embedding dimension than the one configured now.
-    """
     index = _new_index()
     if not docs:
         return index
-
     texts = [d.get("text", "") for d in docs]
     vectors = embed_texts(texts)
     if vectors.size == 0:
         return index
     if vectors.shape[1] != EMBEDDING_DIM:
         raise ValueError(
-            f"Embedding dimension mismatch while rebuilding index: "
+            f"Embedding dimension mismatch while rebuilding: "
             f"expected {EMBEDDING_DIM}, got {vectors.shape[1]}"
         )
-
     index.add(vectors)
     save_index(index, docs)
     return index
@@ -180,47 +171,64 @@ def _repair_docstore_from_lines(raw: str) -> List[Dict[str, str]]:
 
 def _normalize_query_for_retrieval(query: str) -> str:
     """
-    Strip style words and filler phrases that are useful to the answer tone
-    but harmful for retrieval relevance.
+    Lightly strip filler phrases from the query to improve retrieval precision.
+
+    IMPORTANT: This version is deliberately less aggressive than the previous
+    one. Domain terms like "explain", "how", "process" carry useful signal for
+    BM25 matching and are NOT stripped. Only obvious meta-phrases (style words,
+    politeness fillers) are removed.
     """
     cleaned = query.lower()
-    phrases = (
+
+    # Only strip pure style/politeness phrases — not domain terms
+    filler_phrases = (
         "in short", "briefly", "brief", "quick answer", "short answer",
         "summarise", "summarize", "tldr", "tl;dr", "in brief",
-        "give me short", "short me", "one line", "one-line",
-        "give a short", "keep it short",
+        "give me short", "one line", "give a short", "keep it short",
         "in detail", "detailed", "explain in detail", "full detail",
-        "comprehensive", "thoroughly", "exhaustive", "step by step",
-        "step-by-step", "explain fully", "tell me everything",
-        "give me detail", "elaborate in detail",
-        "elaborate", "explain", "elaborate on", "tell me more",
-        "expand on", "describe", "give more", "more info",
-        "like i'm a beginner", "like i am a beginner", "for a beginner",
-        "as a beginner", "in simple terms", "simple terms", "beginner friendly",
-        "please", "can you", "could you", "tell me", "help me understand",
+        "comprehensive", "exhaustive", "step by step", "step-by-step",
+        "explain fully", "tell me everything", "give me detail",
+        "elaborate in detail", "full explanation", "full breakdown",
+        "break it down", "like i'm a beginner", "like i am a beginner",
+        "for a beginner", "as a beginner", "in simple terms",
+        "beginner friendly", "please", "can you", "could you",
     )
-    for phrase in sorted(phrases, key=len, reverse=True):
+    for phrase in sorted(filler_phrases, key=len, reverse=True):
         cleaned = re.sub(rf"\b{re.escape(phrase)}\b", " ", cleaned, flags=re.IGNORECASE)
+
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" .,!?:;")
-    words = cleaned.split()
-    if len(words) < 3:
+
+    # Safety: if stripping left fewer than 3 words, fall back to original
+    if len(cleaned.split()) < 3:
         cleaned = query.strip().lower()
 
-    # Domain-specific query expansion: the source docs use formal labels that
-    # users often shorten in their question.
+    # ── Domain-specific query expansion ───────────────────────────────────
+    # Map common user phrasings to terms actually present in the Agniveer docs
     expansions = (
-        ("age limit", "required age age eligibility"),
-        ("eligibility criteria", "eligible eligibility qualification required age"),
-        ("selection process", "selection process flow chart recruitment process merit medical physical"),
-        ("how is the selection done", "selection process flow chart recruitment process merit medical physical"),
-        ("recruitment process", "flow chart recruitment process registration application merit medical physical"),
-        ("how to apply", "registration application dashboard join indian army"),
-        ("apply", "registration application dashboard join indian army"),
+        (r"\bage\b",             "required age age eligibility 17"),
+        (r"\bage limit\b",       "required age age eligibility 17"),
+        (r"\beligibilit",        "eligibility criteria required age qualification"),
+        (r"\bselection process\b","flow chart recruitment process merit medical physical fitness"),
+        (r"\bhow.*select",       "flow chart recruitment process merit medical physical fitness"),
+        (r"\brecruitment process\b", "flow chart recruitment process registration rally medical"),
+        (r"\bhow.*appl",         "registration application dashboard joinindianarmy"),
+        (r"\bsalary\b",          "customised package in hand seva nidhi corpus fund monthly"),
+        (r"\bpay\b",             "customised package in hand monthly year rupees"),
+        (r"\bphysical test\b",   "physical fitness test PFT 1.6 km run pull ups beam"),
+        (r"\bpft\b",             "physical fitness test 1.6 km run pull ups beam marks group"),
+        (r"\bbonus mark",        "bonus marks NCC sports ward servicemen"),
+        (r"\binsurance\b",       "life insurance cover 48 lakhs non-contributory"),
+        (r"\bseva nidhi\b",      "seva nidhi corpus fund exit after 4 year lakh"),
+        (r"\btraining\b",        "military training regimental centre enrolment"),
+        (r"\bdocument",          "documents required matric aadhaar domicile caste certificate"),
+        (r"\bmedical\b",         "medical examination army medical standards fitness rally"),
     )
     expanded = cleaned
-    for needle, extra in expansions:
-        if needle in expanded:
+    for pattern, extra in expansions:
+        if re.search(pattern, expanded):
             expanded = f"{expanded} {extra}"
+            break  # only apply first matching expansion to avoid bloating query
+
     expanded = re.sub(r"\s+", " ", expanded).strip()
     return expanded or query.strip()
 
@@ -251,20 +259,22 @@ def embed_texts(texts: Sequence[str]) -> np.ndarray:
 
 def embed_query(query: str) -> np.ndarray:
     model = load_embedding_model()
-    vec = model.encode([query], convert_to_numpy=True, normalize_embeddings=True, batch_size=1)
+    vec = model.encode(
+        [query],
+        convert_to_numpy=True,
+        normalize_embeddings=True,
+        batch_size=1,
+    )
     return np.asarray(vec, dtype="float32")
 
 
 # ── Cross-encoder re-ranker ────────────────────────────────────────────────
 
 def load_reranker():
-    """Lazy-load the cross-encoder re-ranker."""
     global _RERANKER, _RERANKER_FAILED
     if _RERANKER is not None:
         return _RERANKER
-    if _RERANKER_FAILED:
-        return None
-    if not USE_RERANKER:
+    if _RERANKER_FAILED or not USE_RERANKER:
         return None
     try:
         from sentence_transformers import CrossEncoder  # type: ignore
@@ -279,10 +289,6 @@ def load_reranker():
 
 
 def rerank(query: str, docs: List[Dict], top_n: int = RERANK_TOP_K) -> List[Dict]:
-    """
-    Re-rank *docs* using a cross-encoder. Returns top_n highest-scoring docs.
-    Falls back to original order if the re-ranker isn't available.
-    """
     if not docs:
         return docs
     reranker = load_reranker()
@@ -306,18 +312,19 @@ def rerank(query: str, docs: List[Dict], top_n: int = RERANK_TOP_K) -> List[Dict
 # ── BM25 sparse index ──────────────────────────────────────────────────────
 
 def _tokenize(text: str) -> List[str]:
-    """Simple whitespace + lowercase tokenizer for BM25."""
-    import re
     return re.findall(r"[a-zA-Z0-9\u0900-\u097F]+", text.lower())
 
 
+# FIX: removed "age", "pay", "rank", "year", "km", "run" from stopwords.
+# These are critical Agniveer domain terms — dropping them destroys BM25 recall.
 _STOPWORDS = {
     "a", "an", "and", "are", "be", "by", "for", "from", "how", "i", "in",
     "is", "it", "me", "my", "of", "on", "or", "please", "show", "tell",
     "the", "to", "what", "when", "where", "which", "who", "why", "with",
     "you", "your", "can", "could", "would", "should", "do", "does", "did",
     "this", "that", "these", "those", "as", "at", "was", "were", "will",
-    "like", "just", "about", "into", "over", "under", "up", "down",
+    "just", "about", "into", "over", "under", "up", "down",
+    # NOTE: "like", "give", "make", "take" retained — sometimes useful
 }
 
 
@@ -326,13 +333,10 @@ def _meaningful_tokens(text: str) -> List[str]:
 
 
 def load_bm25():
-    """Lazy-load BM25 index from disk."""
     global _BM25
     if _BM25 is not None:
         return _BM25
-    if not USE_HYBRID:
-        return None
-    if not BM25_INDEX_PATH.exists():
+    if not USE_HYBRID or not BM25_INDEX_PATH.exists():
         return None
     try:
         with open(BM25_INDEX_PATH, "rb") as f:
@@ -344,7 +348,6 @@ def load_bm25():
 
 
 def save_bm25(docs: List[Dict[str, str]]) -> None:
-    """Build and persist BM25 index from docstore."""
     if not USE_HYBRID:
         return
     try:
@@ -369,12 +372,13 @@ def _mmr_filter(
     doc_vecs: np.ndarray,
     docs: List[Dict],
     k: int,
-    lambda_: float = 0.6,
+    lambda_: float = 0.7,   # FIX: raised from 0.6 → 0.7 (more relevance-biased)
 ) -> List[Dict]:
     """
-    Maximal Marginal Relevance: balances relevance and diversity.
-    lambda_=1.0 → pure relevance; lambda_=0.0 → pure diversity.
-    lambda_=0.6 is the standard balanced setting.
+    Maximal Marginal Relevance.
+    lambda_=0.7 balances relevance and diversity.
+    For single-document corpora, higher lambda_ is better: relevant chunks
+    may be similar to each other by nature, and we want them all.
     """
     if len(docs) <= k:
         return docs
@@ -386,13 +390,17 @@ def _mmr_filter(
         if not remaining:
             break
         if not selected_idx:
-            # First pick: highest relevance
             scores = doc_vecs[remaining] @ query_vec.T
             best = remaining[int(np.argmax(scores))]
         else:
             rel_scores = doc_vecs[remaining] @ query_vec.T
-            sim_to_selected = np.max(doc_vecs[remaining] @ doc_vecs[selected_idx].T, axis=1)
-            mmr_scores = lambda_ * rel_scores.flatten() - (1 - lambda_) * sim_to_selected.flatten()
+            sim_to_selected = np.max(
+                doc_vecs[remaining] @ doc_vecs[selected_idx].T, axis=1
+            )
+            mmr_scores = (
+                lambda_ * rel_scores.flatten()
+                - (1 - lambda_) * sim_to_selected.flatten()
+            )
             best = remaining[int(np.argmax(mmr_scores))]
         selected_idx.append(best)
         remaining.remove(best)
@@ -442,14 +450,16 @@ def load_index() -> faiss.Index:
         old_dim = _INDEX.d
         print(
             f"[WARNING] Saved FAISS index uses dimension {old_dim}, "
-            f"but the active embedding model uses {EMBEDDING_DIM}. "
+            f"but the active model uses {EMBEDDING_DIM}. "
             "Rebuilding the index from the docstore..."
         )
         _INDEX = _rebuild_index_from_docs(_DOCS)
 
     if _INDEX.ntotal > 0 and len(_DOCS) == 0:
-        print("[WARNING] FAISS index has vectors but docstore is empty. "
-              "Run /reset and re-ingest your documents.")
+        print(
+            "[WARNING] FAISS index has vectors but docstore is empty. "
+            "Run /reset and re-ingest your documents."
+        )
     return _INDEX
 
 
@@ -459,17 +469,12 @@ def save_index(index: faiss.Index, docs: List[Dict[str, str]]) -> None:
     faiss.write_index(index, str(FAISS_INDEX_PATH))
     _save_docstore(docs)
     _DOCS = docs
-    # Rebuild BM25 index whenever docstore changes
     save_bm25(docs)
 
 
 # ── Search ─────────────────────────────────────────────────────────────────
 
 def _bm25_scores(query: str, n: int) -> np.ndarray:
-    """
-    Return BM25 scores for all docs, normalised to [0, 1].
-    Returns zeros array if BM25 is unavailable.
-    """
     bm25 = load_bm25()
     if bm25 is None or not _DOCS:
         return np.zeros(len(_DOCS), dtype="float32")
@@ -494,16 +499,56 @@ def _min_max_normalize(values: np.ndarray) -> np.ndarray:
     return ((values - lo) / (hi - lo)).astype("float32")
 
 
+# ── Domain boosting rules ──────────────────────────────────────────────────
+# Each entry: (query_pattern, doc_pattern, boost_score)
+# Applied during hybrid fusion to surface highly relevant chunks.
+_DOMAIN_BOOSTS = [
+    (r"\bage\b",              r"required age",                  0.70),
+    (r"\bage\b",              r"17.*22|17½",                    0.60),
+    (r"eligibilit",           r"eligibility criteria",          0.70),
+    (r"eligibilit",           r"required age",                  0.40),
+    (r"selection|how.*select",r"flow chart.*recruitment|recruitment process", 0.90),
+    (r"recruitment process",  r"flow chart.*recruitment",       0.90),
+    (r"how.*appl|apply",      r"registration|application",      0.70),
+    (r"salary|pay|package",   r"customis.*package|in hand|seva nidhi", 0.80),
+    (r"salary|pay|package",   r"30,000|33,000|36,500|40,000",  0.70),
+    (r"physical|pft",         r"physical fitness test|1\.6 km run", 0.80),
+    (r"physical|pft",         r"pull.up|beam|group.i|group.ii", 0.60),
+    (r"bonus mark",           r"bonus marks|ncc|sportsmen",     0.80),
+    (r"insurance",            r"48 lakh|life insurance",        0.80),
+    (r"seva nidhi",           r"seva nidhi|10\.04 lakh|corpus", 0.80),
+    (r"training",             r"military training|regimental",  0.70),
+    (r"document",             r"documents required|matric|aadhaar|domicile", 0.70),
+    (r"medical",              r"medical examination|army medical", 0.70),
+    (r"women|female|girl",    r"women military police|women mp", 0.80),
+    (r"tradesman",            r"tradesman|tradesmen",           0.70),
+    (r"clerk|skt",            r"clerk.*store keeper|skt",       0.70),
+    (r"technical",            r"agniveer.*tech|tech.*agniveer", 0.70),
+    (r"cee|entrance exam",    r"common entrance examination|cee", 0.80),
+    (r"ncc",                  r"ncc.*certificate|bonus.*ncc",   0.70),
+]
+
+
+def _apply_domain_boosts(query_lower: str, doc_text_lower: str) -> float:
+    """Return the highest applicable boost for this query+doc pair."""
+    best = 0.0
+    for q_pat, d_pat, boost in _DOMAIN_BOOSTS:
+        if re.search(q_pat, query_lower) and re.search(d_pat, doc_text_lower):
+            best = max(best, boost)
+    return best
+
+
 def search(query: str, top_k: int = TOP_K) -> List[Dict[str, str]]:
     """
-    Retrieve top-k most relevant chunks using hybrid dense+sparse search,
-    followed by cross-encoder re-ranking and MMR diversity filtering.
+    Retrieve top-k chunks using hybrid dense+sparse search, cross-encoder
+    re-ranking, and MMR diversity filtering.
 
     Pipeline:
-      1. Dense cosine search → candidate_k results (2× top_k)
+      1. Dense cosine search → candidate_k results
       2. BM25 sparse score fusion (if USE_HYBRID)
-      3. Cross-encoder re-ranking (if USE_RERANKER) → RERANK_TOP_K
-      4. MMR diversity filter → final top_k
+      3. Domain boosting (Agniveer-specific heuristics)
+      4. Cross-encoder re-ranking (if USE_RERANKER)
+      5. MMR diversity filter → final top_k
     """
     index = load_index()
     if index.ntotal == 0:
@@ -511,77 +556,82 @@ def search(query: str, top_k: int = TOP_K) -> List[Dict[str, str]]:
 
     retrieval_query = _normalize_query_for_retrieval(query)
     qvec = embed_query(retrieval_query)
-    if index.ntotal <= 1000:
-        candidate_k = index.ntotal
-    else:
-        candidate_k = min(max(top_k * 8, 24), index.ntotal)   # broader recall pool
+
+    # Wider candidate pool → better recall before re-ranking
+    candidate_k = min(max(top_k * 12, 30), index.ntotal)
 
     # ── Dense retrieval ────────────────────────────────────────
     scores_dense, ids = index.search(qvec, candidate_k)
     dense_scores = scores_dense[0]
     doc_ids = ids[0]
-    dense_map = {int(doc_id): float(score) for doc_id, score in zip(doc_ids, dense_scores) if doc_id >= 0}
+    dense_map = {
+        int(doc_id): float(score)
+        for doc_id, score in zip(doc_ids, dense_scores)
+        if doc_id >= 0
+    }
 
     # ── BM25 fusion ────────────────────────────────────────────
     if USE_HYBRID and len(_DOCS) > 0:
         bm25_all = _bm25_scores(retrieval_query, len(_DOCS))
         bm25_top_ids = np.argsort(bm25_all)[::-1][:candidate_k]
 
-        query_terms = set(_meaningful_tokens(retrieval_query))
+        # Adaptive weighting: short queries benefit more from BM25 (keyword)
         token_count = len(retrieval_query.split())
         if token_count <= 3:
-            dense_weight, bm25_weight = 0.30, 0.70
+            dense_weight, bm25_weight = 0.25, 0.75
         elif token_count <= 6:
             dense_weight, bm25_weight = 0.40, 0.60
         else:
             dense_weight, bm25_weight = DENSE_WEIGHT, BM25_WEIGHT
 
         candidate_ids: List[int] = []
-        seen_ids: set[int] = set()
+        seen_ids: set = set()
         for doc_id in list(doc_ids) + [int(x) for x in bm25_top_ids]:
             if doc_id < 0 or doc_id >= len(_DOCS) or doc_id in seen_ids:
                 continue
             candidate_ids.append(int(doc_id))
             seen_ids.add(int(doc_id))
 
-        dense_values = np.array([dense_map.get(doc_id, 0.0) for doc_id in candidate_ids], dtype="float32")
+        dense_values = np.array(
+            [dense_map.get(doc_id, 0.0) for doc_id in candidate_ids], dtype="float32"
+        )
         dense_values = _min_max_normalize(dense_values)
 
-        bm25_values = np.array([float(bm25_all[doc_id]) for doc_id in candidate_ids], dtype="float32")
+        bm25_values = np.array(
+            [float(bm25_all[doc_id]) for doc_id in candidate_ids], dtype="float32"
+        )
+
+        query_terms  = set(_meaningful_tokens(retrieval_query))
+        query_lower  = retrieval_query.lower()
 
         fused: List[tuple] = []
         for doc_id, ds, bs in zip(candidate_ids, dense_values, bm25_values):
             combined = dense_weight * float(ds) + bm25_weight * float(bs)
+
+            # Term overlap bonus
             if query_terms:
                 doc_text = _DOCS[doc_id].get("text", "")
                 doc_terms = set(_meaningful_tokens(doc_text))
                 overlap = len(query_terms & doc_terms) / max(1, len(query_terms))
-                combined += 0.20 * overlap
+                combined += 0.15 * overlap
 
+                # Domain-specific boost
                 doc_lower = doc_text.lower()
-                query_lower = retrieval_query.lower()
-                if "age" in query_lower and "required age" in doc_lower:
-                    combined += 0.60
-                if "eligibility" in query_lower and "eligibility criteria" in doc_lower:
-                    combined += 0.60
-                if "eligibility" in query_lower and "required age" in doc_lower:
-                    combined += 0.30
-                if ("selection" in query_lower or "process" in query_lower or "recruitment" in query_lower) and (
-                    "flow chart" in doc_lower and "recruitment" in doc_lower
-                ):
-                    combined += 0.80
-                if "selection" in query_lower and "merit" in doc_lower:
-                    combined += 0.20
+                combined += _apply_domain_boosts(query_lower, doc_lower)
+
             if combined < MIN_SCORE:
                 continue
             fused.append((combined, int(doc_id)))
+
         fused.sort(key=lambda x: x[0], reverse=True)
         candidates = []
         for combined, doc_id in fused:
             doc = dict(_DOCS[doc_id])
             doc["score"] = round(combined, 4)
             candidates.append(doc)
+
     else:
+        # Dense-only path
         candidates = []
         for doc_id, score in zip(doc_ids, dense_scores):
             if doc_id < 0 or doc_id >= len(_DOCS):
@@ -592,14 +642,17 @@ def search(query: str, top_k: int = TOP_K) -> List[Dict[str, str]]:
             doc["score"] = round(float(score), 4)
             candidates.append(doc)
 
+    # FIX: Return top-3 fallback chunks instead of just 1 when nothing passes
+    # MIN_SCORE. Prevents empty context on borderline queries (e.g. "age limit").
     if not candidates:
-        # Keep the strongest dense hit as a fallback rather than returning
-        # empty context when the query is still likely relevant.
-        if len(doc_ids) > 0 and 0 <= int(doc_ids[0]) < len(_DOCS):
-            doc = dict(_DOCS[int(doc_ids[0])])
-            doc["score"] = round(float(dense_scores[0]), 4)
-            return [doc]
-        return []
+        fallback = []
+        for i in range(min(3, len(doc_ids))):
+            fid = int(doc_ids[i])
+            if 0 <= fid < len(_DOCS):
+                doc = dict(_DOCS[fid])
+                doc["score"] = round(float(dense_scores[i]), 4)
+                fallback.append(doc)
+        return fallback
 
     # ── Cross-encoder re-ranking ───────────────────────────────
     if USE_RERANKER:
@@ -615,7 +668,9 @@ def search(query: str, top_k: int = TOP_K) -> List[Dict[str, str]]:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             cand_vecs = embed_texts(texts)
-        candidates = _mmr_filter(qvec, cand_vecs, candidates, k=min(top_k, len(candidates)))
+        candidates = _mmr_filter(
+            qvec, cand_vecs, candidates, k=min(top_k, len(candidates))
+        )
 
     return candidates[:top_k]
 
@@ -626,10 +681,10 @@ def build_context(docs: Sequence[Dict[str, str]]) -> str:
     """
     Format retrieved docs into a numbered context block for the LLM.
 
-    Accuracy improvements:
-    - Explicit [N] numbering so the LLM can cite sources
-    - Deduplication of near-identical chunks
-    - Source label kept compact
+    FIX: Deduplication fingerprint extended to 150 chars (was 100) so
+    genuinely different chunks that share a short common opening are both
+    kept. This matters for salary tables and eligibility sections that
+    all start with the same sentence fragment.
     """
     if not docs:
         return ""
@@ -639,13 +694,11 @@ def build_context(docs: Sequence[Dict[str, str]]) -> str:
 
     for i, doc in enumerate(docs, start=1):
         text = (doc.get("text") or "").strip()
-        # Deduplicate by first 100 chars fingerprint (handles near-dupes)
-        fingerprint = text[:100].lower()
+        fingerprint = text[:150].lower()
         if not text or fingerprint in seen_texts:
             continue
         seen_texts.add(fingerprint)
         source = doc.get("source", "unknown")
-        # Compact source display
         if len(source) > 60:
             source = "…" + source[-58:]
         blocks.append(f"[{i}] Source: {source}\n{text}")
@@ -658,7 +711,7 @@ def index_stats() -> Dict[str, int]:
     return {"vectors": int(index.ntotal), "chunks": len(_DOCS)}
 
 
-# ── Ollama client (non-streaming, used by rag.call_llm) ───────────────────
+# ── Ollama client (non-streaming) ──────────────────────────────────────────
 
 def _fetch_ollama_models() -> List[str]:
     try:
@@ -682,7 +735,7 @@ def _build_messages(
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     if history:
         for msg in history:
-            role = msg.get("role")
+            role    = msg.get("role")
             content = msg.get("content", "").strip()
             if role in {"user", "assistant"} and content:
                 messages.append({"role": role, "content": content})

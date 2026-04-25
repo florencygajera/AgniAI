@@ -8,26 +8,26 @@ Run:
     python main.py
 
 Answer styles (auto-detected from your question):
-    Short    — e.g. "What is the age limit in short?"
-    Elaborate— e.g. "Elaborate on the salary structure."
-    Detail   — e.g. "Explain the selection process in detail."
-    (Default is Elaborate when no style keyword is detected.)
+    Short    — "What is the age limit in short?"
+    Elaborate— "Elaborate on the salary structure."   ← default
+    Detail   — "Explain the selection process in detail."
 
 Commands (during chat):
-    /ingest pdf  <path>    — Add a PDF file to the knowledge base
-    /ingest url  <url>     — Add a web page to the knowledge base
-    /ingest txt  <path>    — Add a plain .txt file to the knowledge base
-    /ingest text <content> — Add raw text to the knowledge base
-    /ingest docx <path>    — Add a Word (.docx) file to the knowledge base
+    /ingest pdf  <path>    — Add a PDF file
+    /ingest url  <url>     — Add a web page
+    /ingest txt  <path>    — Add a .txt file
+    /ingest text <content> — Add raw text
+    /ingest docx <path>    — Add a Word (.docx) file
     /sources               — List all ingested sources
     /stats                 — Show index statistics
-    /clear                 — Clear the conversation memory
+    /clear                 — Clear conversation memory
     /reset                 — ⚠ Delete the entire knowledge base index
-    /model <name>          — Switch the Ollama model mid-session
+    /model <name>          — Switch Ollama model mid-session
     /help                  — Show this help message
-    /exit  or  /quit       — Exit AgniAI
+    /exit  or  /quit       — Exit
 """
 
+import re
 import sys
 import textwrap
 from typing import Optional, Tuple
@@ -38,6 +38,9 @@ from config import (
     DATA_DIR,
     INDEX_DIR,
     MAX_CONTEXT_CHARS,
+    MAX_CONTEXT_CHARS_DEFAULT,
+    MAX_TOKENS_STYLE,
+    MAX_TOKENS_DEFAULT,
     SYSTEM_PROMPT,
     SYSTEM_PROMPT_SHORT,
     SYSTEM_PROMPT_ELABORATE,
@@ -74,13 +77,13 @@ def _c(code: str, text: str) -> str:
         return text
     return f"\033[{code}m{text}\033[0m"
 
-def dim(t: str) -> str:    return _c("2",  t)
-def bold(t: str) -> str:   return _c("1",  t)
-def cyan(t: str) -> str:   return _c("96", t)
-def green(t: str) -> str:  return _c("92", t)
-def yellow(t: str) -> str: return _c("93", t)
-def red(t: str) -> str:    return _c("91", t)
-def blue(t: str) -> str:   return _c("94", t)
+def dim(t):    return _c("2",  t)
+def bold(t):   return _c("1",  t)
+def cyan(t):   return _c("96", t)
+def green(t):  return _c("92", t)
+def yellow(t): return _c("93", t)
+def red(t):    return _c("91", t)
+def blue(t):   return _c("94", t)
 
 
 BANNER = cyan(r"""
@@ -90,7 +93,7 @@ BANNER = cyan(r"""
 /_/ |_\___/_//_/___|___/|_|___/  \___/
 """) + bold("  Agniveer AI Assistant  — Offline · Local · Private\n")
 
-HELP_TEXT = f"""
+HELP_TEXT = """
 Available commands:
 
   /ingest pdf  <path>     Add a PDF to the knowledge base
@@ -107,9 +110,9 @@ Available commands:
   /exit  or  /quit        Exit AgniAI
 
 Answer style is detected automatically from your question:
-  • "... in short"     → short  (1-3 bullets)
-  • "elaborate ..."    → elaborate (bullets + context)   ← default
-  • "... in detail"    → detail (full structured answer)
+  • "... in short"     → SHORT  (2-4 tight bullets)
+  • "elaborate ..."    → ELABORATE (6-12 bullets + context)   ← default
+  • "... in detail"    → DETAIL (full numbered sections, every figure)
 
 Recommended small models for CPU:
   ollama pull phi3:mini      (~2.3 GB)
@@ -117,7 +120,6 @@ Recommended small models for CPU:
   ollama pull gemma2:2b     (~1.6 GB)
 """
 
-# ── Style names for display ────────────────────────────────────────────────
 _STYLE_LABEL = {
     "short":     "SHORT",
     "elaborate": "ELABORATE",
@@ -133,6 +135,25 @@ _STYLE_COLOR = {
 
 # ── Answer-style detection ─────────────────────────────────────────────────
 
+def _kw_match(query_lower: str, keywords: list) -> bool:
+    """
+    Whole-word / whole-phrase keyword match.
+    Prevents "shorting" from triggering SHORT mode, etc.
+    Multi-word phrases are matched as substrings (already specific enough).
+    Single words are matched with word boundaries.
+    """
+    for kw in keywords:
+        if " " in kw:
+            # Multi-word phrase: substring match is fine (specific enough)
+            if kw in query_lower:
+                return True
+        else:
+            # Single word: require word boundary to avoid false positives
+            if re.search(rf"\b{re.escape(kw)}\b", query_lower):
+                return True
+    return False
+
+
 def detect_answer_style(query: str) -> Tuple[str, str]:
     """
     Inspect *query* for style keywords and return (style_name, system_prompt).
@@ -141,24 +162,33 @@ def detect_answer_style(query: str) -> Tuple[str, str]:
 
     Returns
     -------
-    style_name   : one of "short", "elaborate", "detail"
-    system_prompt: the matching SYSTEM_PROMPT_* string
+    style_name   : "short" | "elaborate" | "detail"
+    system_prompt: matching SYSTEM_PROMPT_* string
     """
     q = query.lower()
 
-    for kw in STYLE_SHORT_KEYWORDS:
-        if kw in q:
-            return "short", SYSTEM_PROMPT_SHORT
+    if _kw_match(q, STYLE_SHORT_KEYWORDS):
+        return "short", SYSTEM_PROMPT_SHORT
 
-    for kw in STYLE_DETAIL_KEYWORDS:
-        if kw in q:
-            return "detail", SYSTEM_PROMPT_DETAIL
+    if _kw_match(q, STYLE_DETAIL_KEYWORDS):
+        return "detail", SYSTEM_PROMPT_DETAIL
 
-    for kw in STYLE_ELABORATE_KEYWORDS:
-        if kw in q:
-            return "elaborate", SYSTEM_PROMPT_ELABORATE
+    if _kw_match(q, STYLE_ELABORATE_KEYWORDS):
+        return "elaborate", SYSTEM_PROMPT_ELABORATE
 
     return "elaborate", SYSTEM_PROMPT_ELABORATE
+
+
+def get_context_limit(style: str) -> int:
+    """Return the MAX_CONTEXT_CHARS for the given style."""
+    if isinstance(MAX_CONTEXT_CHARS, dict):
+        return MAX_CONTEXT_CHARS.get(style, MAX_CONTEXT_CHARS_DEFAULT)
+    # backwards compat if someone passes old int config
+    return int(MAX_CONTEXT_CHARS)
+
+
+def get_token_limit(style: str) -> int:
+    return MAX_TOKENS_STYLE.get(style, MAX_TOKENS_DEFAULT)
 
 
 # ── Directory bootstrap ────────────────────────────────────────────────────
@@ -169,13 +199,22 @@ def _ensure_dirs() -> None:
 
 
 def _should_use_rag(query: str) -> bool:
-    """Skip RAG for greetings and pure small-talk."""
+    """
+    Skip RAG only for pure small-talk / greetings.
+    Any query with 2+ words that looks substantive gets RAG.
+    """
     q = query.strip().lower()
-    greetings = {
+    _GREETINGS = {
         "hi", "hello", "hey", "thanks", "thank you", "ok", "okay", "bye",
         "good morning", "good evening", "good afternoon", "greetings",
+        "welcome", "sup", "yo",
     }
-    if len(q.split()) == 1 and q in greetings:
+    words = q.split()
+    # Single greeting word → no RAG
+    if len(words) == 1 and q in _GREETINGS:
+        return False
+    # Two-word greeting phrases → no RAG
+    if len(words) <= 3 and q in _GREETINGS:
         return False
     return True
 
@@ -195,22 +234,21 @@ def _handle_ingest(command: str) -> None:
     kind   = parts[1].lower()
     target = parts[2].strip()
 
+    fn_map = {
+        "pdf":  ingest_pdf,
+        "url":  ingest_url,
+        "txt":  ingest_txt,
+        "text": ingest_text,
+        "docx": ingest_docx,
+    }
+
+    if kind not in fn_map:
+        print(yellow(f"  Unknown type '{kind}'. Use: pdf, url, txt, text, docx."))
+        return
+
     try:
         print(dim(f"  Ingesting {kind}..."))
-        if kind == "pdf":
-            count = ingest_pdf(target)
-        elif kind == "url":
-            count = ingest_url(target)
-        elif kind == "txt":
-            count = ingest_txt(target)
-        elif kind == "text":
-            count = ingest_text(target)
-        elif kind == "docx":
-            count = ingest_docx(target)
-        else:
-            print(yellow(f"  Unknown type '{kind}'. Use: pdf, url, txt, text, docx."))
-            return
-
+        count = fn_map[kind](target)
         if count == 0:
             print(yellow("  Source already ingested (use /reset to re-ingest)."))
         else:
@@ -336,7 +374,11 @@ def run_chat() -> None:
         style_name, active_system_prompt = detect_answer_style(raw)
         style_label = _STYLE_LABEL[style_name]
         style_color = _STYLE_COLOR[style_name]
-        print(dim(f"  Answer style: ") + style_color(style_label))
+        context_limit = get_context_limit(style_name)
+        token_limit   = get_token_limit(style_name)
+
+        print(dim(f"  Answer style: ") + style_color(style_label)
+              + dim(f"  [ctx={context_limit} chars, tokens≤{token_limit}]"))
 
         # ── RAG pipeline ───────────────────────────────────────────────────
         use_rag = _should_use_rag(raw)
@@ -345,8 +387,8 @@ def run_chat() -> None:
             print(dim("  Searching knowledge base..."))
             docs    = search(raw, top_k=TOP_K)
             context = build_context(docs)
-            if len(context) > MAX_CONTEXT_CHARS:
-                context = context[:MAX_CONTEXT_CHARS].rstrip() + "\n...[truncated]..."
+            if len(context) > context_limit:
+                context = context[:context_limit].rstrip() + "\n...[truncated]..."
 
         if use_rag and not context:
             no_info = (
@@ -366,7 +408,7 @@ def run_chat() -> None:
         if use_rag:
             messages = [{"role": "system", "content": active_system_prompt}]
             if history:
-                messages.extend(history[-4:])
+                messages.extend(history[-6:])   # fixed: was -4
             user_content = (
                 f"Reference information:\n{context}\n\n"
                 f"Question: {raw}"
@@ -377,12 +419,12 @@ def run_chat() -> None:
                 "recruitment scheme. Respond naturally and concisely."
             )}]
             if history:
-                messages.extend(history[-4:])
+                messages.extend(history[-6:])
             user_content = raw
 
         messages.append({"role": "user", "content": user_content})
 
-        # ── LLM call ───────────────────────────────────────────────────────
+        # ── LLM call with per-style token limit ────────────────────────────
         try:
             print(f"\nAgniAI: ", end="", flush=True)
             result = chat_with_fallback(
@@ -390,6 +432,7 @@ def run_chat() -> None:
                 active_model,
                 messages,
                 stream_tokens=True,
+                max_tokens_override=token_limit,
             )
             answer = result.text
             print("\n")
