@@ -33,6 +33,7 @@ from config import (
     TOKEN_SAFETY_BUFFER,
     TOP_K as _CONFIG_TOP_K,
     estimate_message_tokens,
+    style_structure_instruction,
     trim_to_complete_sentence,
 )
 
@@ -161,7 +162,10 @@ def build_rag_context(query: str) -> str:
 
 def build_messages(query: str, history: List[dict], style: str = "elaborate") -> List[dict]:
     context = build_rag_context(query)
-    messages: List[dict] = [{"role": "system", "content": STRICT_RAG_PROMPT}]
+    messages: List[dict] = [{
+        "role": "system",
+        "content": f"{STRICT_RAG_PROMPT}\n\n{style_structure_instruction(style)}",
+    }]
     if history:
         messages.extend(history[-MAX_HISTORY_MESSAGES:])
     if context:

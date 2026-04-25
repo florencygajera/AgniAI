@@ -32,6 +32,7 @@ from config import (
     STYLE_SHORT_KEYWORDS,
     TOP_K,
     estimate_message_tokens,
+    style_structure_instruction,
     trim_to_complete_sentence,
 )
 from ingest import clear_index, ingest_docx, ingest_pdf, ingest_text, ingest_txt, ingest_url, list_sources
@@ -229,6 +230,7 @@ def _build_messages(
     messages = [{"role": "system", "content": (
         "You are AgniAI, a helpful assistant for India's Agniveer recruitment scheme. "
         "Respond naturally and concisely."
+        f"\n\n{style_structure_instruction(style)}"
     )}]
     if history:
         messages.extend(history)

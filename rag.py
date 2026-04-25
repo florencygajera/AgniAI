@@ -60,6 +60,7 @@ from config import (
     MAX_CONTEXT_CHARS_DEFAULT,
     HIGH_RETRIEVAL_CONFIDENCE,
     LOW_RETRIEVAL_CONFIDENCE,
+    style_structure_instruction,
 )
 
 logger = logging.getLogger(__name__)
@@ -944,6 +945,7 @@ def build_strict_messages(
     system_content = STRICT_RAG_PROMPT
     if reasoning:
         system_content = STRICT_RAG_PROMPT_COMPUTE
+    system_content = f"{system_content}\n\n{style_structure_instruction(style)}"
     messages = [{"role": "system", "content": system_content}]
     if history:
         for msg in history:

@@ -117,9 +117,9 @@ STYLE_ELABORATE_KEYWORDS = [
 ]
 
 STYLE_OUTPUT_GUIDANCE = {
-    "short": "Answer in 2 to 4 bullet points. Keep it concise and factual.",
-    "elaborate": "Answer in 4 to 8 bullet points. Be factual and moderately detailed.",
-    "detail": "Answer in structured sections with bullet points and concrete facts.",
+    "short": "Use numbered points only. Give all key points with titles and at most one short line each.",
+    "elaborate": "Use numbered points only. Keep the same points, with 2 to 3 lines of explanation per point.",
+    "detail": "Use numbered points only. Keep the same points, with full explanation under each point.",
 }
 
 # Strict prompt
@@ -141,6 +141,17 @@ STRICT_RAG_PROMPT_COMPUTE = (
     "If it is missing, say 'Not available in the document'. "
     "Be concise and complete. Prioritize key points. Ensure the answer ends with a full sentence."
 )
+
+STRUCTURE_FIRST_PROMPT = (
+    "Always extract all key points first. Then adjust explanation depth based on style. "
+    "Do not change the structure. Use numbered points only. Keep the same point order across styles."
+)
+
+
+def style_structure_instruction(style: str) -> str:
+    style_key = (style or "").strip().lower()
+    guidance = STYLE_OUTPUT_GUIDANCE.get(style_key, STYLE_OUTPUT_GUIDANCE["elaborate"])
+    return f"{STRUCTURE_FIRST_PROMPT} {guidance}"
 
 SYSTEM_PROMPT_SHORT = STRICT_RAG_PROMPT
 SYSTEM_PROMPT_ELABORATE = STRICT_RAG_PROMPT
