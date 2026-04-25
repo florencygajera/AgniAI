@@ -120,28 +120,45 @@ def get_token_limit(style: str) -> int:
     return MAX_TOKENS_STYLE.get(style, MAX_TOKENS_DEFAULT)
 
 
-def _should_use_rag(query: str) -> bool:
+def _classify_intent(query: str) -> str:
     q = query.strip().lower()
     tokens = [t for t in q.split() if t]
     if not tokens:
-        return False
-    domain_terms = (
-        "age", "eligibility", "salary", "pay", "selection", "medical", "pft",
-        "physical", "training", "insurance", "ncc", "document", "apply",
-        "application", "seva", "nidhi", "recruitment", "joining",
-    )
-    if any(term in q for term in domain_terms):
-        return True
+        return "reject"
+
     greeting_like = {
         "hi", "hello", "hey", "thanks", "thank you", "good morning",
         "good afternoon", "good evening", "bye", "greetings", "welcome",
         "ok", "okay",
     }
     if q in greeting_like and len(tokens) <= 2:
-        return False
-    if len(tokens) <= 2 and not q.endswith("?"):
-        return False
-    return True
+        return "chat"
+
+    small_talk = (
+        "how are you", "what's up", "whats up", "good morning", "good afternoon",
+        "good evening", "thank you", "thanks",
+    )
+    if any(phrase in q for phrase in small_talk):
+        return "chat"
+
+    domain_terms = (
+        "age", "eligibility", "salary", "pay", "selection", "medical", "pft",
+        "physical", "training", "insurance", "ncc", "document", "apply",
+        "application", "seva", "nidhi", "recruitment", "joining", "service",
+        "agni", "agniveer", "benefit", "package", "rally", "fitness",
+    )
+    if any(term in q for term in domain_terms):
+        return "rag"
+
+    reasoning_terms = ("calculate", "total", "sum", "overall", "aggregate", "combined", "after 4 years", "over 4 years")
+    if any(term in q for term in reasoning_terms) and any(term in q for term in ("salary", "pay", "service", "seva", "benefit", "nidhi", "year", "years")):
+        return "rag"
+
+    return "reject"
+
+
+def _should_use_rag(query: str) -> bool:
+    return _classify_intent(query) == "rag"
 
 
 def _ensure_dirs() -> None:
@@ -270,13 +287,18 @@ def run_chat() -> None:
         token_limit = get_token_limit(style_name)
         print(dim("  Answer style: ") + style_color(style_label) + dim(f"  [ctx={context_limit} chars, tokens≤{token_limit}]"))
 
-        use_rag = _should_use_rag(raw)
-        bundle = {"docs": [], "context": "", "confidence": 0.0}
+        intent = _classify_intent(raw)
+        use_rag = intent == "rag"
+        bundle = {"docs": [], "context": "", "confidence": 0.0, "mode": "reject", "reasoning": False}
         if use_rag:
             print(dim("  Preparing retrieval..."))
             bundle = prepare_rag_bundle(raw, top_k=TOP_K, style=style_name)
         context = bundle.get("context", "") if isinstance(bundle, dict) else ""
         confidence = float(bundle.get("confidence", 0.0)) if isinstance(bundle, dict) else 0.0
+        mode = bundle.get("mode", "reject") if isinstance(bundle, dict) else "reject"
+        reasoning = bool(bundle.get("reasoning", False)) if isinstance(bundle, dict) else False
+        if use_rag:
+            print(dim(f"  Retrieval confidence: {confidence:.3f} | mode={mode} | reasoning={reasoning}"))
 
         history = memory.history()
         history_hash = _history_fingerprint(history)
@@ -295,7 +317,7 @@ def run_chat() -> None:
             memory.add("assistant", cached_answer)
             continue
 
-        if use_rag and (not context or confidence < 0.62):
+        if intent == "reject":
             answer = REFERENCE_FALLBACK
             print(f"\nAgniAI: {answer}\n")
             memory.add("user", raw)
@@ -307,6 +329,7 @@ def run_chat() -> None:
             raw,
             context=context if use_rag else "",
             style=style_name,
+            reasoning=reasoning,
             history=history[-6:] if history else None,
         ) if use_rag else [{"role": "system", "content": (
             "You are AgniAI, a helpful assistant for India's Agniveer recruitment scheme. Respond naturally and concisely."
@@ -326,7 +349,9 @@ def run_chat() -> None:
                 max_tokens_override=token_limit,
             )
             answer = result.text
-            if use_rag and not answer_is_grounded(answer, context):
+            if use_rag and mode == "normal_answer" and not answer_is_grounded(answer, context):
+                answer = REFERENCE_FALLBACK
+            elif use_rag and mode == "strict_answer" and not context.strip() and not bundle.get("docs"):
                 answer = REFERENCE_FALLBACK
             print()
         except PartialResponseError as exc:

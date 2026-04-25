@@ -59,6 +59,8 @@ from config import (
     MAX_CACHE_ENTRIES,
     MAX_CONTEXT_CHARS,
     MAX_CONTEXT_CHARS_DEFAULT,
+    HIGH_RETRIEVAL_CONFIDENCE,
+    LOW_RETRIEVAL_CONFIDENCE,
 )
 
 logger = logging.getLogger(__name__)
@@ -295,6 +297,45 @@ def _normalize_query_for_retrieval(query: str) -> str:
             cleaned = f"{cleaned} {extra}"
             break
     return re.sub(r"\s+", " ", cleaned).strip() or query.strip()
+
+
+def _rewrite_query_candidates(query: str) -> List[str]:
+    q = query.strip().lower()
+    candidates = [q]
+    if any(word in q for word in ("calculate", "total", "sum", "overall", "aggregate", "combined")):
+        candidates.append(
+            re.sub(r"\b(calculate|total|sum|overall|aggregate|combined)\b", " ", q)
+        )
+    return [re.sub(r"\s+", " ", cand).strip() for cand in candidates if cand.strip()]
+
+
+def _query_similarity(a: str, b: str) -> float:
+    try:
+        av = _cache_query_embedding(a)
+        bv = _cache_query_embedding(b)
+        return float(np.dot(av[0], bv[0]))
+    except Exception:
+        return 0.0
+
+
+def safe_rewrite_query(query: str) -> str:
+    candidates = _rewrite_query_candidates(query)
+    if len(candidates) == 1:
+        return candidates[0]
+    original = candidates[0]
+    best = original
+    best_score = -1.0
+    for candidate in candidates:
+        score = _query_similarity(original, candidate)
+        if score > best_score:
+            best_score = score
+            best = candidate
+    if best != original and best_score < 0.88:
+        logger.debug("Rewrite rejected for query=%r: best_score=%.3f", query, best_score)
+        return original
+    if best != original:
+        logger.debug("Rewrite accepted for query=%r -> %r (score=%.3f)", query, best, best_score)
+    return best
 
 
 def _query_cache_key(query: str) -> str:
@@ -608,10 +649,19 @@ def search(query: str, top_k: int = TOP_K) -> List[Dict[str, str]]:
     if index.ntotal == 0:
         return []
 
-    retrieval_query = _normalize_query_for_retrieval(query)
+    rewritten_query = _normalize_query_for_retrieval(query)
+    retrieval_query = safe_rewrite_query(rewritten_query)
+    if retrieval_query != rewritten_query:
+        logger.debug(
+            "Query rewrite downgraded to preserve intent. original=%r rewritten=%r final=%r",
+            query,
+            rewritten_query,
+            retrieval_query,
+        )
+    logger.debug("Retrieval query: original=%r rewritten=%r final=%r", query, rewritten_query, retrieval_query)
     qvec = _cache_query_embedding(retrieval_query)
 
-    candidate_k = min(max(top_k * 6, 12), 24, index.ntotal)
+    candidate_k = min(max(top_k * 8, 20), 60, index.ntotal)
     scores_dense, ids = index.search(qvec, candidate_k)
     dense_scores = scores_dense[0]
     doc_ids = ids[0]
@@ -716,9 +766,33 @@ def build_context(
     ordered = sorted(docs, key=lambda doc: float(doc.get("score", 0.0)), reverse=True)
     ordered = [doc for doc in ordered if float(doc.get("score", 0.0)) >= min_score]
     ordered = _dedupe_docs(ordered)[:max_chunks]
+    if not ordered:
+        ordered = _dedupe_docs(sorted(docs, key=lambda doc: float(doc.get("score", 0.0)), reverse=True))[:max_chunks]
 
     if not ordered:
         return ""
+
+    def _truncate_to_limit(text: str, limit: int) -> str:
+        text = (text or "").strip()
+        if limit <= 0 or len(text) <= limit:
+            return text
+        sentences = re.split(r"(?<=[.!?])\s+|\n+", text)
+        if len(sentences) <= 1:
+            return text[:limit].rstrip()
+        pieces: List[str] = []
+        total = 0
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if not sentence:
+                continue
+            extra = len(sentence) + (1 if pieces else 0)
+            if total + extra > limit:
+                break
+            pieces.append(sentence)
+            total += extra
+        if pieces:
+            return " ".join(pieces).strip()
+        return text[:limit].rstrip()
 
     blocks: List[str] = []
     total_chars = 0
@@ -730,9 +804,14 @@ def build_context(
         if len(source) > 60:
             source = "..." + source[-57:]
         score = float(doc.get("score", 0.0))
-        block = f"[{i}] score={score:.3f} source={source}\n{text}"
-        if total_chars + len(block) > max_chars:
+        header = f"[{i}] score={score:.3f} source={source}\n"
+        remaining = max_chars - total_chars - len(header)
+        if remaining <= 0:
             break
+        truncated_text = _truncate_to_limit(text, remaining)
+        block = f"{header}{truncated_text}".strip()
+        if not truncated_text:
+            continue
         blocks.append(block)
         total_chars += len(block)
         if total_chars >= max_chars:
@@ -761,6 +840,31 @@ def retrieval_confidence(docs: Sequence[Dict[str, str]], query: str) -> float:
     return round(float(confidence), 4)
 
 
+def is_reasoning_query(query: str) -> bool:
+    q = query.lower()
+    reasoning_terms = (
+        "calculate", "total", "sum", "overall", "aggregate", "combined",
+        "how much", "how many", "after 4 years", "over 4 years", "for 4 years",
+        "what happens after", "in total",
+    )
+    return any(term in q for term in reasoning_terms)
+
+
+def decide_answer_mode(
+    *,
+    query: str,
+    docs: Sequence[Dict[str, str]],
+    confidence: float,
+) -> str:
+    if not docs:
+        return "reject"
+    if confidence < LOW_RETRIEVAL_CONFIDENCE:
+        return "strict_answer"
+    if confidence < HIGH_RETRIEVAL_CONFIDENCE:
+        return "strict_answer"
+    return "normal_answer"
+
+
 def prepare_rag_bundle(
     query: str,
     *,
@@ -774,18 +878,35 @@ def prepare_rag_bundle(
         if isinstance(MAX_CONTEXT_CHARS, dict)
         else MAX_CONTEXT_CHARS_DEFAULT
     )
+    confidence = retrieval_confidence(docs, query)
+    mode = decide_answer_mode(query=query, docs=docs, confidence=confidence)
+    context_min_score = STRICT_MIN_SCORE if mode == "normal_answer" else LOW_RETRIEVAL_CONFIDENCE
     context = build_context(
         docs,
-        max_chunks=STRICT_TOP_K,
-        min_score=STRICT_MIN_SCORE,
+        max_chunks=max(STRICT_TOP_K, min(5, top_k)),
+        min_score=context_min_score,
         max_chars=context_limit,
+    )
+    logger.debug(
+        "RAG bundle: confidence=%.3f low=%.2f high=%.2f mode=%s context_min=%.2f docs=%s",
+        confidence,
+        LOW_RETRIEVAL_CONFIDENCE,
+        HIGH_RETRIEVAL_CONFIDENCE,
+        mode,
+        context_min_score,
+        [
+            {"score": d.get("score"), "source": d.get("source")}
+            for d in docs[: min(5, len(docs))]
+        ],
     )
     return {
         "query": query,
         "retrieval_query": retrieval_query,
         "docs": docs,
         "context": context,
-        "confidence": retrieval_confidence(docs, query),
+        "confidence": confidence,
+        "mode": mode,
+        "reasoning": is_reasoning_query(query),
         "style": style,
     }
 
@@ -815,12 +936,17 @@ def build_strict_messages(
     *,
     context: str,
     style: str = "elaborate",
+    reasoning: bool = False,
     history: Optional[List[Dict[str, str]]] = None,
 ) -> List[Dict[str, str]]:
     system_content = STRICT_RAG_PROMPT
+    if reasoning:
+        system_content = STRICT_RAG_PROMPT_COMPUTE
     style_guidance = STYLE_OUTPUT_GUIDANCE.get(style)
     if style_guidance:
         system_content = f"{STRICT_RAG_PROMPT}\n\nStyle:\n- {style_guidance}"
+        if reasoning:
+            system_content = f"{STRICT_RAG_PROMPT_COMPUTE}\n\nStyle:\n- {style_guidance}"
     messages = [{"role": "system", "content": system_content}]
     if history:
         for msg in history:

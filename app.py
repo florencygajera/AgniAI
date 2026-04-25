@@ -39,6 +39,7 @@ from rag import (
     get_cached_response,
     index_stats,
     make_response_cache_key,
+    decide_answer_mode,
     prepare_rag_bundle,
     set_cached_response,
 )
@@ -89,19 +90,11 @@ def detect_answer_style(query: str) -> tuple[str, str]:
     return "elaborate", "elaborate"
 
 
-def _should_use_rag(query: str) -> bool:
+def _classify_intent(query: str) -> str:
     q = query.strip().lower()
     tokens = [t for t in q.split() if t]
     if not tokens:
-        return False
-
-    domain_terms = (
-        "age", "eligibility", "salary", "pay", "selection", "medical", "pft",
-        "physical", "training", "insurance", "ncc", "document", "apply",
-        "application", "seva", "nidhi", "recruitment", "joining",
-    )
-    if any(term in q for term in domain_terms):
-        return True
+        return "reject"
 
     greeting_like = {
         "hi", "hello", "hey", "thanks", "thank you", "good morning",
@@ -109,10 +102,33 @@ def _should_use_rag(query: str) -> bool:
         "ok", "okay",
     }
     if q in greeting_like and len(tokens) <= 2:
-        return False
-    if len(tokens) <= 2 and not q.endswith("?"):
-        return False
-    return True
+        return "chat"
+
+    small_talk = (
+        "how are you", "what's up", "whats up", "good morning", "good afternoon",
+        "good evening", "thank you", "thanks",
+    )
+    if any(phrase in q for phrase in small_talk):
+        return "chat"
+
+    domain_terms = (
+        "age", "eligibility", "salary", "pay", "selection", "medical", "pft",
+        "physical", "training", "insurance", "ncc", "document", "apply",
+        "application", "seva", "nidhi", "recruitment", "joining", "service",
+        "agni", "agniveer", "benefit", "package", "rally", "medical", "fitness",
+    )
+    if any(term in q for term in domain_terms):
+        return "rag"
+
+    reasoning_terms = ("calculate", "total", "sum", "overall", "aggregate", "combined", "after 4 years", "over 4 years")
+    if any(term in q for term in reasoning_terms) and any(term in q for term in ("salary", "pay", "service", "seva", "benefit", "nidhi", "year", "years")):
+        return "rag"
+
+    return "reject"
+
+
+def _should_use_rag(query: str) -> bool:
+    return _classify_intent(query) == "rag"
 
 
 def _get_session_id(data: dict) -> str:
@@ -140,11 +156,18 @@ def _build_messages(
     query: str,
     style: str,
     context: str,
+    reasoning: bool,
     history: list[dict] | None,
     use_rag: bool,
 ) -> list[dict]:
     if use_rag:
-        return build_strict_messages(query, context=context, style=style, history=history)
+        return build_strict_messages(
+            query,
+            context=context,
+            style=style,
+            reasoning=reasoning,
+            history=history,
+        )
 
     messages = [{"role": "system", "content": (
         "You are AgniAI, a helpful assistant for India's Agniveer recruitment scheme. "
@@ -230,7 +253,8 @@ def chat():
 
     style_name, _ = detect_answer_style(message)
     token_limit = _get_token_limit(style_name)
-    use_rag = _should_use_rag(message)
+    intent = _classify_intent(message)
+    use_rag = intent == "rag"
 
     bundle = {"docs": [], "context": "", "confidence": 0.0}
     if use_rag:
@@ -238,6 +262,8 @@ def chat():
 
     context = bundle.get("context", "") if isinstance(bundle, dict) else ""
     confidence = float(bundle.get("confidence", 0.0)) if isinstance(bundle, dict) else 0.0
+    mode = bundle.get("mode", "reject") if isinstance(bundle, dict) else "reject"
+    reasoning = bool(bundle.get("reasoning", False)) if isinstance(bundle, dict) else False
 
     history = _memory.history(session_id)
     history_hash = _history_fingerprint(history)
@@ -255,7 +281,7 @@ def chat():
         _memory.add("assistant", cached_answer, session_id=session_id)
         return jsonify(ok_chat(answer=cached_answer, style=style_name, session_id=session_id))
 
-    if use_rag and (not context or confidence < MIN_RETRIEVAL_CONFIDENCE):
+    if intent == "reject":
         answer = "Not available in the document"
         _memory.add("user", message, session_id=session_id)
         _memory.add("assistant", answer, session_id=session_id)
@@ -270,6 +296,7 @@ def chat():
                     "cached": False,
                     "grounded": False,
                     "confidence": confidence,
+                    "mode": mode,
                 },
             )
         return jsonify(ok_chat(answer=answer, style=style_name, session_id=session_id))
@@ -278,6 +305,7 @@ def chat():
         query=message,
         style=style_name,
         context=context,
+        reasoning=reasoning,
         history=history[-6:] if history else None,
         use_rag=use_rag,
     )
@@ -322,7 +350,9 @@ def chat():
                 return
 
             answer = "".join(pieces).strip() or str(outcome.get("answer", "")).strip()
-            if use_rag and not answer_is_grounded(answer, context):
+            if use_rag and mode == "normal_answer" and not answer_is_grounded(answer, context):
+                answer = "Not available in the document"
+            elif use_rag and mode == "strict_answer" and not context.strip() and not bundle.get("docs"):
                 answer = "Not available in the document"
             _memory.add("user", message, session_id=session_id)
             _memory.add("assistant", answer, session_id=session_id)
@@ -337,6 +367,7 @@ def chat():
                 "cached": False,
                 "grounded": bool(use_rag),
                 "confidence": confidence,
+                "mode": mode,
             },
         )
 
@@ -352,7 +383,9 @@ def chat():
     except RuntimeError as exc:
         return jsonify(*err(f"LLM service unavailable: {exc}", 503))
 
-    if use_rag and not answer_is_grounded(answer, context):
+    if use_rag and mode == "normal_answer" and not answer_is_grounded(answer, context):
+        answer = "Not available in the document"
+    elif use_rag and mode == "strict_answer" and not context.strip() and not bundle.get("docs"):
         answer = "Not available in the document"
 
     _memory.add("user", message, session_id=session_id)

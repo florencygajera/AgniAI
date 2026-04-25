@@ -43,12 +43,14 @@ CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "80"))
 CHUNK_MIN_WORDS = int(os.getenv("CHUNK_MIN_WORDS", "12"))
 
 # Retrieval
-TOP_K = int(os.getenv("TOP_K", "4"))
-RERANK_TOP_K = int(os.getenv("RERANK_TOP_K", "3"))
+TOP_K = int(os.getenv("TOP_K", "8"))
+RERANK_TOP_K = int(os.getenv("RERANK_TOP_K", "5"))
 MIN_SCORE = float(os.getenv("MIN_SCORE", "0.20"))
 STRICT_MIN_SCORE = float(os.getenv("STRICT_MIN_SCORE", "0.70"))
-STRICT_TOP_K = int(os.getenv("STRICT_TOP_K", "3"))
-MIN_RETRIEVAL_CONFIDENCE = float(os.getenv("MIN_RETRIEVAL_CONFIDENCE", "0.62"))
+STRICT_TOP_K = int(os.getenv("STRICT_TOP_K", "5"))
+LOW_RETRIEVAL_CONFIDENCE = float(os.getenv("LOW_RETRIEVAL_CONFIDENCE", "0.45"))
+HIGH_RETRIEVAL_CONFIDENCE = float(os.getenv("HIGH_RETRIEVAL_CONFIDENCE", "0.70"))
+MIN_RETRIEVAL_CONFIDENCE = LOW_RETRIEVAL_CONFIDENCE
 
 # Hybrid retrieval
 DENSE_WEIGHT = float(os.getenv("DENSE_WEIGHT", "0.55"))
@@ -125,7 +127,24 @@ STRICT_RAG_PROMPT = """You are a strict question-answering system.
 Rules:
 - Answer ONLY using the provided context
 - Do NOT add any external knowledge
-- If answer is not present, say: 'Not available in the document'
+- If partial information is available, answer using that
+- If completely missing, say: 'Not available in the document'
+- Do NOT hallucinate
+- Keep answers precise and structured
+- Ignore irrelevant context
+
+Format:
+- Use bullet points
+- Be concise and factual"""
+
+STRICT_RAG_PROMPT_COMPUTE = """You are a strict question-answering system.
+
+Rules:
+- Answer ONLY using the provided context
+- Do NOT add any external knowledge
+- You may compute or aggregate values ONLY from the provided context
+- If partial information is available, answer using that
+- If completely missing, say: 'Not available in the document'
 - Do NOT hallucinate
 - Keep answers precise and structured
 - Ignore irrelevant context
