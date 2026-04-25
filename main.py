@@ -34,11 +34,11 @@ from memory import ConversationMemory
 from ollama_cpu_chat import MODEL_NAME as DEFAULT_MODEL_NAME
 from ollama_cpu_chat import PartialResponseError, chat_with_fallback
 from rag import (
-    answer_is_grounded,
     build_strict_messages,
     get_cached_response,
     index_stats,
     make_response_cache_key,
+    generate_structured_answer,
     is_reasoning_query,
     prepare_rag_bundle,
     set_cached_response,
@@ -176,6 +176,27 @@ def _compute_context_char_budget(*, query: str, style: str, history: list[dict] 
 def _finalize_answer(answer: str) -> str:
     final = trim_to_complete_sentence(answer)
     return final or REFERENCE_FALLBACK
+
+
+def _generate_structured_rag_answer(
+    *,
+    query: str,
+    style: str,
+    docs: list[dict],
+    model: str,
+    session,
+    reasoning: bool,
+    history: list[dict] | None,
+) -> dict:
+    return generate_structured_answer(
+        query,
+        docs=docs,
+        style=style,
+        model=model,
+        session=session,
+        reasoning=reasoning,
+        history=history,
+    )
 
 
 def _classify_intent(query: str) -> str:
@@ -389,37 +410,45 @@ def run_chat() -> None:
             set_cached_response(response_key, answer)
             continue
 
-        messages = build_strict_messages(
-            raw,
-            context=context if use_rag else "",
-            style=style_name,
-            reasoning=reasoning,
-            history=history[-6:] if history else None,
-        ) if use_rag else [{"role": "system", "content": (
-            "You are AgniAI, a helpful assistant for India's Agniveer recruitment scheme. Respond naturally and concisely."
-            f"\n\n{style_structure_instruction(style_name)}"
-        )}]
-        if not use_rag and history:
-            messages.extend(history[-6:])
-        if not use_rag:
-            messages.append({"role": "user", "content": raw})
-
         try:
             print("\nAgniAI: ", end="", flush=True)
-            result = chat_with_fallback(
-                session,
-                active_model or DEFAULT_MODEL_NAME,
-                messages,
-                stream_tokens=True,
-                max_tokens_override=token_limit,
-            )
-            answer = result.text
-            if use_rag and mode == "normal_answer" and not answer_is_grounded(answer, context):
-                answer = REFERENCE_FALLBACK
-            elif use_rag and mode == "strict_answer" and not context.strip() and not bundle.get("docs"):
-                answer = REFERENCE_FALLBACK
-            answer = _finalize_answer(answer)
-            print()
+            if use_rag:
+                structured = _generate_structured_rag_answer(
+                    query=raw,
+                    style=style_name,
+                    docs=bundle.get("docs", []) if isinstance(bundle, dict) else [],
+                    model=active_model or DEFAULT_MODEL_NAME,
+                    session=session,
+                    reasoning=reasoning,
+                    history=history[-6:] if history else None,
+                )
+                answer = str(structured.get("answer", "")).strip()
+                if not answer and structured.get("points"):
+                    answer = "\n".join(
+                        f"{idx}. {point.get('title', '').strip()}"
+                        for idx, point in enumerate(structured.get("points", []), start=1)
+                        if point.get("title")
+                    )
+                if not answer:
+                    answer = REFERENCE_FALLBACK
+                print(answer)
+            else:
+                messages = [{"role": "system", "content": (
+                    "You are AgniAI, a helpful assistant for India's Agniveer recruitment scheme. Respond naturally and concisely."
+                    f"\n\n{style_structure_instruction(style_name)}"
+                )}]
+                if history:
+                    messages.extend(history[-6:])
+                messages.append({"role": "user", "content": raw})
+                result = chat_with_fallback(
+                    session,
+                    active_model or DEFAULT_MODEL_NAME,
+                    messages,
+                    stream_tokens=True,
+                    max_tokens_override=token_limit,
+                )
+                answer = _finalize_answer(result.text)
+                print()
         except PartialResponseError as exc:
             print(f"\n  Partial response: {exc}\n")
             answer = _finalize_answer(exc.partial_text or REFERENCE_FALLBACK)

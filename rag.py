@@ -11,9 +11,10 @@ import re
 import time
 import warnings
 from difflib import SequenceMatcher
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, Iterable, List, Optional, Sequence
 
 import faiss
 import numpy as np
@@ -60,6 +61,7 @@ from config import (
     MAX_CONTEXT_CHARS_DEFAULT,
     HIGH_RETRIEVAL_CONFIDENCE,
     LOW_RETRIEVAL_CONFIDENCE,
+    STYLE_POINT_TOKEN_BUDGET,
     style_structure_instruction,
 )
 
@@ -74,6 +76,7 @@ _BM25 = None
 _QUERY_EMBED_CACHE = TTLCache(maxsize=MAX_CACHE_ENTRIES, ttl=EMBED_CACHE_TTL)
 _RETRIEVAL_CACHE = TTLCache(maxsize=MAX_CACHE_ENTRIES, ttl=RETRIEVAL_CACHE_TTL)
 _RESPONSE_CACHE = TTLCache(maxsize=MAX_CACHE_ENTRIES, ttl=RESPONSE_CACHE_TTL)
+_MAX_STRUCTURED_POINTS = int(os.getenv("MAX_STRUCTURED_POINTS", "12"))
 
 
 def _ensure_dirs() -> None:
@@ -252,6 +255,401 @@ def _dedupe_docs(docs: List[Dict[str, str]], similarity_threshold: float = 0.88)
         seen_fingerprints.add(fingerprint)
         deduped.append(doc)
     return deduped
+
+
+def _sentence_split(text: str) -> List[str]:
+    text = (text or "").strip()
+    if not text:
+        return []
+    chunks = re.split(r"(?<=[.!?])\s+|\n+", text)
+    return [chunk.strip() for chunk in chunks if chunk and chunk.strip()]
+
+
+def _split_section_candidates(text: str) -> List[str]:
+    text = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text:
+        return []
+    sections: List[str] = []
+    current: List[str] = []
+    for raw_line in text.split("\n"):
+        line = raw_line.strip()
+        if not line:
+            if current:
+                sections.append(" ".join(current).strip())
+                current = []
+            continue
+        bullet_like = bool(re.match(r"^(\d+[\).\:-]|\-|\*|•)\s+", line))
+        heading_like = _looks_like_heading(line)
+        if heading_like and current:
+            sections.append(" ".join(current).strip())
+            current = [line]
+            continue
+        if bullet_like and current:
+            sections.append(" ".join(current).strip())
+            current = [line]
+            continue
+        current.append(line)
+    if current:
+        sections.append(" ".join(current).strip())
+    return [section for section in sections if section]
+
+
+def _looks_like_heading(line: str) -> bool:
+    line = re.sub(r"^\s*(?:\d+[\).\:-]?\s*|\-|\*|•\s*)", "", (line or "").strip())
+    if not line:
+        return False
+    if len(line) > 80:
+        return False
+    words = line.split()
+    if len(words) > 12:
+        return False
+    alpha_words = [w for w in words if re.search(r"[A-Za-z\u0900-\u097F]", w)]
+    if not alpha_words:
+        return False
+    if line.endswith(":"):
+        return True
+    if line.isupper() and len(words) <= 8:
+        return True
+    titleish = sum(1 for w in alpha_words if w[:1].isupper())
+    if titleish >= max(1, len(alpha_words) - 1):
+        return True
+    return False
+
+
+def _strip_leading_marker(text: str) -> str:
+    return re.sub(r"^\s*(?:\d+[\).\:-]?\s*|\-|\*|•\s*)", "", (text or "").strip())
+
+
+def _clean_point_title(title: str) -> str:
+    title = _strip_leading_marker(title)
+    title = title.strip(" \t:-—")
+    title = re.sub(r"\s+", " ", title)
+    if not title:
+        return ""
+    title = re.split(r"[.!?]", title)[0].strip()
+    for separator in (" : ", " - ", " — ", " – "):
+        if separator in title:
+            left, right = title.split(separator, 1)
+            if len(left.split()) <= 8:
+                title = left.strip()
+                break
+            if len(right.split()) <= 8:
+                title = right.strip()
+                break
+    if ":" in title:
+        left, right = title.split(":", 1)
+        if len(left.split()) <= 8:
+            title = left.strip()
+        elif right.strip():
+            title = right.strip()
+    words = title.split()
+    if len(words) > 10:
+        title = " ".join(words[:10]).strip()
+    return title.strip(" \t:-—")
+
+
+def _infer_support_text(section: str, title: str) -> str:
+    section = (section or "").strip()
+    if not section:
+        return ""
+    if title:
+        title_norm = _normalise_text(title)
+        section_norm = _normalise_text(section)
+        if section_norm.startswith(title_norm):
+            section = section[len(title):].lstrip(" :-—\n\t")
+        else:
+            section = re.sub(re.escape(title), "", section, count=1, flags=re.IGNORECASE).strip(" :-—\n\t")
+    sentences = _sentence_split(section)
+    if not sentences:
+        return section.strip()
+    if len(sentences) == 1:
+        return sentences[0]
+    return " ".join(sentences[:3]).strip()
+
+
+def _section_to_point(section: str) -> Optional[Dict[str, str]]:
+    section = (section or "").strip()
+    if not section:
+        return None
+    lines = [line.strip() for line in section.splitlines() if line.strip()]
+    first_line = lines[0] if lines else section
+    title = ""
+    support = ""
+
+    if _looks_like_heading(first_line):
+        title = _clean_point_title(first_line)
+        support = _infer_support_text(" ".join(lines[1:]) if len(lines) > 1 else "", title)
+    else:
+        title = _clean_point_title(first_line)
+        support = _infer_support_text(section, title)
+
+    if not title:
+        sentences = _sentence_split(section)
+        if sentences:
+            title = _clean_point_title(sentences[0])
+            support = _infer_support_text(section, title)
+    if not title:
+        return None
+    return {"title": title, "support": support, "raw": section}
+
+
+def _dedupe_points(points: Iterable[Dict[str, str]]) -> List[Dict[str, str]]:
+    deduped: List[Dict[str, str]] = []
+    seen: set[str] = set()
+    for point in points:
+        title = _clean_point_title(point.get("title", ""))
+        if not title:
+            continue
+        key = _normalise_text(title)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append({
+            "title": title,
+            "support": (point.get("support") or "").strip(),
+            "raw": (point.get("raw") or "").strip(),
+        })
+    return deduped
+
+
+def _fallback_points_from_docs(docs: Sequence[Dict[str, str]]) -> List[Dict[str, str]]:
+    points: List[Dict[str, str]] = []
+    for doc in docs:
+        text = (doc.get("text") or "").strip()
+        if not text:
+            continue
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        candidate = ""
+        if lines:
+            for line in lines:
+                cleaned = _clean_point_title(line)
+                if cleaned:
+                    candidate = cleaned
+                    break
+        if not candidate:
+            sentences = _sentence_split(text)
+            candidate = _clean_point_title(sentences[0]) if sentences else ""
+        if not candidate:
+            candidate = _clean_point_title(doc.get("source", ""))
+        if not candidate:
+            continue
+        support = _infer_support_text(text, candidate)
+        points.append({"title": candidate, "support": support, "raw": text})
+    return _dedupe_points(points)
+
+
+def extract_key_points(
+    docs: Sequence[Dict[str, str]],
+    *,
+    query: str = "",
+    max_points: int = _MAX_STRUCTURED_POINTS,
+) -> List[Dict[str, str]]:
+    if not docs:
+        return []
+
+    ordered = sorted(docs, key=lambda doc: float(doc.get("score", 0.0)), reverse=True)
+    candidates: List[Dict[str, str]] = []
+    for doc in ordered:
+        text = (doc.get("text") or "").strip()
+        if not text:
+            continue
+        sections = _split_section_candidates(text)
+        if not sections:
+            sections = [text]
+        for section in sections:
+            point = _section_to_point(section)
+            if not point:
+                continue
+            point["score"] = str(float(doc.get("score", 0.0)))
+            point["source"] = doc.get("source", "")
+            candidates.append(point)
+
+    deduped = _dedupe_points(candidates)
+    if not deduped:
+        deduped = _fallback_points_from_docs(ordered)
+
+    if not deduped and query.strip():
+        deduped = [{"title": _clean_point_title(query) or query.strip(), "support": "", "raw": query.strip()}]
+
+    if max_points > 0:
+        deduped = deduped[:max_points]
+    return deduped
+
+
+def _style_point_token_budget(style: str) -> int:
+    style_key = (style or "").strip().lower()
+    return int(STYLE_POINT_TOKEN_BUDGET.get(style_key, STYLE_POINT_TOKEN_BUDGET["elaborate"]))
+
+
+def _limit_sentence_count(text: str, max_sentences: int) -> str:
+    text = (text or "").strip()
+    if not text or max_sentences <= 0:
+        return ""
+    sentences = _sentence_split(text)
+    if not sentences:
+        return text
+    return " ".join(sentences[:max_sentences]).strip()
+
+
+def _shape_explanation(text: str, style: str) -> str:
+    style_key = (style or "").strip().lower()
+    text = trim_to_complete_sentence((text or "").strip())
+    if style_key == "short":
+        return ""
+    if not text:
+        return ""
+    if style_key == "elaborate":
+        return _limit_sentence_count(text, 2)
+    return text
+
+
+def _clean_generated_explanation(text: str, title: str) -> str:
+    text = (text or "").strip()
+    if not text:
+        return ""
+    text = _strip_leading_marker(text)
+    title_norm = _normalise_text(title)
+    text_norm = _normalise_text(text)
+    if title_norm and text_norm.startswith(title_norm):
+        text = text[len(title):].lstrip(" :-—\n\t")
+    return text.strip()
+
+
+def _build_point_messages(
+    *,
+    query: str,
+    point: Dict[str, str],
+    style: str,
+    reasoning: bool = False,
+    history: Optional[List[Dict[str, str]]] = None,
+) -> List[Dict[str, str]]:
+    system_content = STRICT_RAG_PROMPT_COMPUTE if reasoning else STRICT_RAG_PROMPT
+    system_content = (
+        f"{system_content}\n\n"
+        f"{style_structure_instruction(style)}\n"
+        "You are writing the explanation for a single numbered point in a fixed structured answer. "
+        "Do not add, remove, or rename points. Output only the explanation body for this one point. "
+        "Use only the supplied point title and supporting context. "
+        "If the supporting context is thin, stay conservative and summarize only what is explicit."
+    )
+    messages: List[Dict[str, str]] = [{"role": "system", "content": system_content}]
+    if history:
+        for msg in history:
+            role = msg.get("role")
+            content = (msg.get("content") or "").strip()
+            if role in {"user", "assistant"} and content:
+                messages.append({"role": role, "content": content})
+    support = (point.get("support") or point.get("raw") or "").strip()
+    user_content = (
+        f"Question: {query}\n"
+        f"Point title: {point.get('title', '').strip()}\n"
+        f"Supporting context:\n{support}\n\n"
+        f"Style: {style}\n"
+        "Return only the explanation text for this point."
+    )
+    messages.append({"role": "user", "content": user_content})
+    return messages
+
+
+def _generate_point_explanation(
+    *,
+    session,
+    model: str,
+    query: str,
+    point: Dict[str, str],
+    style: str,
+    reasoning: bool = False,
+    history: Optional[List[Dict[str, str]]] = None,
+) -> str:
+    style_key = (style or "").strip().lower()
+    if style_key == "short":
+        return ""
+    support = (point.get("support") or point.get("raw") or "").strip()
+    if not support:
+        return ""
+    messages = _build_point_messages(
+        query=query,
+        point=point,
+        style=style,
+        reasoning=reasoning,
+        history=history,
+    )
+    token_budget = _style_point_token_budget(style_key)
+    from ollama_cpu_chat import chat_with_fallback  # local import to avoid circular dependency
+
+    try:
+        result = chat_with_fallback(
+            session,
+            model,
+            messages,
+            stream_tokens=False,
+            max_tokens_override=token_budget,
+        )
+        cleaned = _clean_generated_explanation(result.text, point.get("title", ""))
+        return _shape_explanation(cleaned, style)
+    except Exception as exc:
+        logger.debug("Point generation failed for %r: %s", point.get("title", ""), exc)
+        return ""
+
+
+def format_structured_answer(points: Sequence[Dict[str, str]], explanations: Sequence[str], style: str) -> str:
+    style_key = (style or "").strip().lower()
+    lines: List[str] = []
+    for idx, point in enumerate(points, start=1):
+        title = _clean_point_title(point.get("title", "")) or f"Point {idx}"
+        lines.append(f"{idx}. {title}")
+        if style_key == "short":
+            continue
+        explanation = ""
+        if idx - 1 < len(explanations):
+            explanation = _shape_explanation(
+                _clean_generated_explanation(explanations[idx - 1], title),
+                style,
+            )
+        if explanation:
+            lines.append(f"   {explanation}")
+    return "\n".join(lines).strip()
+
+
+def generate_structured_answer(
+    query: str,
+    *,
+    docs: Sequence[Dict[str, str]],
+    style: str,
+    model: str,
+    session,
+    reasoning: bool = False,
+    history: Optional[List[Dict[str, str]]] = None,
+    max_points: int = _MAX_STRUCTURED_POINTS,
+) -> Dict[str, object]:
+    points = extract_key_points(docs, query=query, max_points=max_points)
+    if not points and docs:
+        points = _fallback_points_from_docs(docs)
+    explanations: List[str] = []
+    for point in points:
+        explanations.append(
+            _generate_point_explanation(
+                session=session,
+                model=model,
+                query=query,
+                point=point,
+                style=style,
+                reasoning=reasoning,
+                history=None,
+            )
+        )
+
+    answer = format_structured_answer(points, explanations, style)
+    if not answer and points:
+        answer = format_structured_answer(points, [""] * len(points), style)
+
+    return {
+        "answer": answer.strip(),
+        "points": points,
+        "explanations": explanations,
+        "structured": bool(points),
+        "token_budget_per_point": _style_point_token_budget(style),
+    }
 
 
 def _normalize_query_for_retrieval(query: str) -> str:
@@ -890,6 +1288,7 @@ def prepare_rag_bundle(
         min_score=context_min_score,
         max_chars=context_limit,
     )
+    points = extract_key_points(docs, query=query)
     logger.debug(
         "RAG bundle: confidence=%.3f low=%.2f high=%.2f mode=%s context_min=%.2f docs=%s",
         confidence,
@@ -907,6 +1306,7 @@ def prepare_rag_bundle(
         "retrieval_query": retrieval_query,
         "docs": docs,
         "context": context,
+        "points": points,
         "confidence": confidence,
         "mode": mode,
         "reasoning": is_reasoning_query(query),

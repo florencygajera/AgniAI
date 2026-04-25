@@ -117,9 +117,15 @@ STYLE_ELABORATE_KEYWORDS = [
 ]
 
 STYLE_OUTPUT_GUIDANCE = {
-    "short": "Use numbered points only. Give all key points with titles and at most one short line each.",
-    "elaborate": "Use numbered points only. Keep the same points, with 2 to 3 lines of explanation per point.",
-    "detail": "Use numbered points only. Keep the same points, with full explanation under each point.",
+    "short": "Use numbered points only. Keep the exact same point list. Write only the point title, with no extra explanation.",
+    "elaborate": "Use numbered points only. Keep the exact same point list. Add 1 to 2 short lines under each title.",
+    "detail": "Use numbered points only. Keep the exact same point list. Add a full explanation under each title.",
+}
+
+STYLE_POINT_TOKEN_BUDGET = {
+    "short": int(os.getenv("STYLE_SHORT_POINT_TOKENS", "10")),
+    "elaborate": int(os.getenv("STYLE_ELABORATE_POINT_TOKENS", "40")),
+    "detail": int(os.getenv("STYLE_DETAIL_POINT_TOKENS", "80")),
 }
 
 # Strict prompt
@@ -128,8 +134,8 @@ REFERENCE_FALLBACK = "Not available in the document"
 STRICT_RAG_PROMPT = (
     "You are a strict question-answering system. "
     "Use only the provided context. Do not add external knowledge. "
+    "If context exists, always produce a structured answer instead of 'Not available in the document'. "
     "If the answer is partially available, use what is present. "
-    "If it is missing, say 'Not available in the document'. "
     "Be concise and complete. Prioritize key points. Ensure the answer ends with a full sentence."
 )
 
@@ -137,14 +143,16 @@ STRICT_RAG_PROMPT_COMPUTE = (
     "You are a strict question-answering system. "
     "Use only the provided context. Do not add external knowledge. "
     "You may compute or aggregate values only from the provided context. "
+    "If context exists, always produce a structured answer instead of 'Not available in the document'. "
     "If the answer is partially available, use what is present. "
-    "If it is missing, say 'Not available in the document'. "
     "Be concise and complete. Prioritize key points. Ensure the answer ends with a full sentence."
 )
 
 STRUCTURE_FIRST_PROMPT = (
-    "Always extract all key points first. Then adjust explanation depth based on style. "
-    "Do not change the structure. Use numbered points only. Keep the same point order across styles."
+    "Always extract all key points first and keep them in the same order across styles. "
+    "Do not change the structure. Use numbered points only. "
+    "Short answers keep only the title, elaborate answers add 1 to 2 lines, and detail answers add the full explanation. "
+    "Never drop a point because of length; shorten explanations instead."
 )
 
 

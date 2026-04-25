@@ -40,12 +40,12 @@ from memory import ConversationMemory
 from ollama_cpu_chat import MODEL_NAME as DEFAULT_MODEL
 from ollama_cpu_chat import PartialResponseError, chat_with_fallback
 from rag import (
-    answer_is_grounded,
     build_strict_messages,
     get_cached_response,
     index_stats,
     make_response_cache_key,
     decide_answer_mode,
+    generate_structured_answer,
     is_reasoning_query,
     prepare_rag_bundle,
     set_cached_response,
@@ -238,6 +238,27 @@ def _build_messages(
     return messages
 
 
+def _generate_structured_rag_answer(
+    *,
+    query: str,
+    style: str,
+    docs: list[dict],
+    model: str,
+    session,
+    reasoning: bool,
+    history: list[dict] | None,
+) -> dict:
+    return generate_structured_answer(
+        query,
+        docs=docs,
+        style=style,
+        model=model,
+        session=session,
+        reasoning=reasoning,
+        history=history,
+    )
+
+
 def _answer_via_llm(*, messages: list[dict], model: str, token_limit: int, stream: bool, on_token=None) -> str:
     result = chat_with_fallback(
         _session,
@@ -368,14 +389,94 @@ def chat():
             )
         return jsonify(ok_chat(answer=answer, style=style_name, session_id=session_id))
 
-    messages = _build_messages(
-        query=message,
-        style=style_name,
-        context=context,
-        reasoning=reasoning,
-        history=history[-6:] if history else None,
-        use_rag=use_rag,
-    )
+    if use_rag:
+        structured_history = history[-6:] if history else None
+        docs = bundle.get("docs", []) if isinstance(bundle, dict) else []
+        if stream:
+            token_queue: Queue[str | None] = Queue()
+            outcome: dict[str, object] = {}
+
+            def _worker() -> None:
+                try:
+                    structured = _generate_structured_rag_answer(
+                        query=message,
+                        style=style_name,
+                        docs=docs,
+                        model=current_model,
+                        session=_session,
+                        reasoning=reasoning,
+                        history=structured_history,
+                    )
+                    answer_text = str(structured.get("answer", "")).strip()
+                    outcome["structured"] = structured
+                    outcome["answer"] = answer_text
+                    for line in answer_text.splitlines(keepends=True) or [answer_text]:
+                        if line:
+                            token_queue.put(line)
+                except Exception as exc:
+                    outcome["error"] = str(exc)
+                finally:
+                    token_queue.put(None)
+
+            threading.Thread(target=_worker, daemon=True).start()
+
+            def _generator():
+                pieces: list[str] = []
+                while True:
+                    try:
+                        token = token_queue.get(timeout=FIRST_TOKEN_TIMEOUT)
+                    except Empty:
+                        yield f"event: error\ndata: {json.dumps({'error': 'First token timeout'}, ensure_ascii=False)}\n\n"
+                        return
+                    if token is None:
+                        break
+                    pieces.append(token)
+                    yield token
+
+                if "error" in outcome:
+                    yield f"event: error\ndata: {json.dumps({'error': str(outcome['error'])}, ensure_ascii=False)}\n\n"
+                    return
+
+                answer = "".join(pieces).strip() or str(outcome.get("answer", "")).strip()
+                _memory.add("user", message, session_id=session_id)
+                _memory.add("assistant", answer, session_id=session_id)
+                set_cached_response(response_key, answer)
+
+            return _stream_answer_response(
+                answer_generator=_generator,
+                status_payload={
+                    "success": True,
+                    "style": style_name,
+                    "session_id": session_id,
+                    "cached": False,
+                    "grounded": True,
+                    "confidence": confidence,
+                    "mode": mode,
+                },
+            )
+
+        structured = _generate_structured_rag_answer(
+            query=message,
+            style=style_name,
+            docs=docs,
+            model=current_model,
+            session=_session,
+            reasoning=reasoning,
+            history=structured_history,
+        )
+        answer = str(structured.get("answer", "")).strip()
+        if not answer and structured.get("points"):
+            answer = "\n".join(
+                f"{idx}. {point.get('title', '').strip()}"
+                for idx, point in enumerate(structured.get("points", []), start=1)
+                if point.get("title")
+            )
+        if not answer:
+            answer = "Not available in the document"
+        _memory.add("user", message, session_id=session_id)
+        _memory.add("assistant", answer, session_id=session_id)
+        set_cached_response(response_key, answer)
+        return jsonify(ok_chat(answer=answer, style=style_name, session_id=session_id))
 
     if stream:
         token_queue: Queue[str | None] = Queue()
@@ -417,9 +518,7 @@ def chat():
                 return
 
             answer = "".join(pieces).strip() or str(outcome.get("answer", "")).strip()
-            if use_rag and mode == "normal_answer" and not answer_is_grounded(answer, context):
-                answer = REFERENCE_FALLBACK
-            elif use_rag and mode == "strict_answer" and not context.strip() and not bundle.get("docs"):
+            if use_rag and mode == "strict_answer" and not context.strip() and not bundle.get("docs"):
                 answer = REFERENCE_FALLBACK
             answer = _finalize_answer(answer)
             _memory.add("user", message, session_id=session_id)
@@ -451,9 +550,7 @@ def chat():
     except RuntimeError as exc:
         return jsonify(*err(f"LLM service unavailable: {exc}", 503))
 
-    if use_rag and mode == "normal_answer" and not answer_is_grounded(answer, context):
-        answer = REFERENCE_FALLBACK
-    elif use_rag and mode == "strict_answer" and not context.strip() and not bundle.get("docs"):
+    if use_rag and mode == "strict_answer" and not context.strip() and not bundle.get("docs"):
         answer = REFERENCE_FALLBACK
     answer = _finalize_answer(answer)
 
